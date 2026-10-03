@@ -276,6 +276,7 @@ def generate_questions():
 
         # Suggestions / Description
         suggestions = data.get("suggestions") or data.get("description", "")
+        exclude_questions = data.get("exclude_questions", [])
         model = data.get("model", DEFAULT_MODEL)
 
         if not subject_name and not chapters:
@@ -283,6 +284,11 @@ def generate_questions():
                 "status": "error",
                 "message": "At least 'subject_name' (or 'topic') or 'chapters' must be provided."
             }), 400
+
+        # Generate a unique generation nonce to prevent deterministic repetition
+        import uuid
+        import time
+        generation_nonce = f"{uuid.uuid4().hex[:8]}-{int(time.time() * 1000)}"
 
         context_parts = []
         if class_name:
@@ -296,25 +302,33 @@ def generate_questions():
         context_parts.append(f"Requested Question Types: {', '.join(question_types)}")
         if suggestions:
             context_parts.append(f"Specific Suggestions & Requirements: {suggestions}")
+        if exclude_questions and isinstance(exclude_questions, list):
+            context_parts.append(f"Exclude These Previously Generated Questions (Do not repeat):\n  - " + "\n  - ".join([str(q) for q in exclude_questions[:10]]))
         
         context_str = "\n".join(context_parts)
 
         system_prompt = (
-            "You are an expert curriculum designer for Edusoft. "
-            "Your role is to create high-standard academic questions aligned with school syllabi. "
+            "You are an expert curriculum designer and examination author for Edusoft. "
+            "Your role is to create fresh, novel, diverse, and high-standard academic questions aligned with school syllabi. "
+            "CRITICAL: Each generation must be distinct and creative. Explore different subtopics, application scenarios, "
+            "numerical values, formulas, and conceptual angles within the given chapter(s). Do NOT generate repetitive or standard template questions. "
             "Do NOT include explanations. Output strictly valid JSON."
         )
 
         user_prompt = f"""
-Generate exactly {question_count} educational question(s) based on the following specifications:
+Generate exactly {question_count} fresh and distinct educational question(s) based on the following specifications:
 
 {context_str}
 
-Ensure:
-1. Questions are distributed across the requested chapters and question types ({', '.join(question_types)}).
-2. For MCQ questions: Provide 4 clear options and indicate the correct answer.
-3. For Short and Long answer questions: Provide complete model answers and step-by-step marking schemes where applicable.
-4. Do NOT include any 'explanation' field.
+Random Variation Seed: {generation_nonce}
+
+DIVERSITY & UNIQUENESS MANDATE:
+- Cover different sub-topics and practical/theoretical angles across the chapter(s).
+- For numerical questions, use fresh, non-trivial realistic values and units.
+- For MCQs, create novel plausible distractors (options) and varied question phrasing.
+- Distribute across the requested question types ({', '.join(question_types)}).
+- For Short and Long answer questions: Provide complete model answers and step-by-step marking schemes where applicable.
+- Do NOT include any 'explanation' field.
 
 Return a valid JSON object matching this schema:
 {{
@@ -344,7 +358,7 @@ Return a valid JSON object matching this schema:
 }}
 """
 
-        logger.info(f"Generating {question_count} questions for '{subject_name}' ({class_name})")
+        logger.info(f"Generating {question_count} distinct questions for '{subject_name}' ({class_name}) [Nonce: {generation_nonce}]")
 
         response = client.chat.completions.create(
             model=model,
@@ -353,7 +367,8 @@ Return a valid JSON object matching this schema:
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.7
+            temperature=0.88,
+            top_p=0.95
         )
 
         raw_content = response.choices[0].message.content
