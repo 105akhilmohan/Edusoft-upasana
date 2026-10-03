@@ -1,6 +1,6 @@
 # Edusoft Question Generator API
 
-A Flask microservice integrated with OpenAI to generate customized educational questions based on **topic**, **description**, and **count**.
+A Flask microservice integrated with OpenAI to generate customized educational questions based on **Class**, **Subject**, **Chapters**, **Question Count**, **Question Types**, and **Suggestions**.
 
 ---
 
@@ -24,17 +24,11 @@ A Flask microservice integrated with OpenAI to generate customized educational q
 
 ### 1. Local Setup
 
-#### Prerequisites
-- Python 3.10+
-- `pip`
-
-#### Steps
 ```bash
-# Create and activate virtual environment (optional but recommended)
+# Create and activate virtual environment (optional)
 python -m venv venv
-
 # Windows:
-venv\Scripts\activate
+.\venv\Scripts\Activate.ps1
 # Linux/macOS:
 source venv/bin/activate
 
@@ -44,24 +38,20 @@ pip install -r requirements.txt
 # Run application
 python app.py
 ```
-The server will start at `http://localhost:5000`.
+The server starts at `http://localhost:5000`.
 
 ---
 
 ### 2. Run with Docker & Docker Compose
 
-#### Build & Run
 ```bash
+# Build and run
 docker-compose up --build
-```
 
-#### Run in Background
-```bash
+# Run in background
 docker-compose up -d
-```
 
-#### Stop Container
-```bash
+# Stop container
 docker-compose down
 ```
 
@@ -87,68 +77,88 @@ docker-compose down
 - **Method:** `POST`
 - **Headers:** `Content-Type: application/json`
 
-#### Request Body
+#### Request Payload
 ```json
 {
-  "topic": "Photosynthesis",
-  "description": "Light-dependent and light-independent reactions in plant biology for grade 10 students",
-  "count": 3,
-  "difficulty": "medium",
-  "question_type": "multiple_choice"
+  "class_name": "Class 10",
+  "subject_name": "Physics",
+  "chapters": [
+    "Chapter 1: Force, Work, Energy and Power",
+    "Chapter 2: Light and Refraction"
+  ],
+  "question_count": 5,
+  "difficulty": "Medium",
+  "question_types": ["MCQ", "Short", "Long"],
+  "suggestions": "Include numerical problems with step markings"
 }
 ```
 
-#### Request Parameters
+#### Parameters
 | Parameter | Type | Required | Description | Default |
 | :--- | :--- | :--- | :--- | :--- |
-| `topic` | string | **Yes** | Subject or topic for question generation | — |
-| `description` | string | No | Additional context, target audience, or sub-topics | `""` |
-| `count` | integer | No | Number of questions to generate (1–50) | `5` |
-| `difficulty` | string | No | `easy`, `medium`, `hard`, or `mixed` | `medium` |
-| `question_type`| string | No | `multiple_choice`, `true_false`, `short_answer`, `mixed` | `multiple_choice` |
+| `class_name` | string | No | Class / Grade level (e.g., `"Class 10"`) | `""` |
+| `subject_name` | string | **Yes** | Subject or Topic (e.g., `"Physics"`) | — |
+| `chapters` | array[str] | No | List of chapters covered | `[]` |
+| `question_count` | integer | No | Total questions to generate (1–50) | `5` |
+| `difficulty` | string | No | `"Easy"`, `"Medium"`, `"Hard"`, or `"Mixed"` | `"Medium"` |
+| `question_types` | array[str] | No | Types of questions (e.g., `["MCQ", "Short", "Long"]`) | `["MCQ", "Short", "Long"]` |
+| `suggestions` | string | No | Additional requirements (e.g., `"Include numerical problems with step markings"`) | `""` |
 
 ---
 
-#### Sample Response
+#### Sample Output Response
 ```json
 {
   "success": true,
   "data": {
-    "topic": "Photosynthesis",
-    "total_questions": 3,
-    "difficulty": "medium",
+    "class_name": "Class 10",
+    "subject_name": "Physics",
+    "chapters": [
+      "Chapter 1: Force, Work, Energy and Power",
+      "Chapter 2: Light and Refraction"
+    ],
+    "total_questions": 5,
+    "difficulty": "Medium",
     "questions": [
       {
         "id": 1,
-        "type": "multiple_choice",
-        "question": "Where do the light-dependent reactions of photosynthesis take place inside a plant cell?",
+        "chapter": "Chapter 1: Force, Work, Energy and Power",
+        "type": "MCQ",
+        "marks": 1,
+        "question": "If the velocity of a moving body is doubled, its kinetic energy becomes:",
         "options": [
-          "Thylakoid membrane",
-          "Stroma",
-          "Mitochondrial matrix",
-          "Cytoplasm"
+          "A) Halved",
+          "B) Doubled",
+          "C) Four times",
+          "D) Unchanged"
         ],
-        "correct_answer": "Thylakoid membrane",
-        "explanation": "Light-dependent reactions occur in the thylakoid membranes of chloroplasts where chlorophyll absorbs sunlight.",
-        "difficulty": "medium"
+        "correct_answer": "C) Four times",
+        "step_marking": [],
+        "explanation": "Kinetic energy KE = 1/2 * m * v^2. Since KE is proportional to v^2, doubling the velocity increases KE by a factor of 4.",
+        "difficulty": "Medium"
+      },
+      {
+        "id": 2,
+        "chapter": "Chapter 1: Force, Work, Energy and Power",
+        "type": "Numerical",
+        "marks": 3,
+        "question": "A crane lifts a mass of 500 kg vertically upwards through a height of 20 m in 10 seconds. Calculate the power exerted by the crane. (Take g = 9.8 m/s²)",
+        "options": [],
+        "correct_answer": "9800 W (or 9.8 kW)",
+        "step_marking": [
+          {
+            "step": "Calculate Work done: W = m * g * h = 500 * 9.8 * 20 = 98000 J",
+            "marks": 1.5
+          },
+          {
+            "step": "Calculate Power: P = Work / Time = 98000 / 10 = 9800 W",
+            "marks": 1.5
+          }
+        ],
+        "explanation": "Power is the rate of doing work. Total work is equal to the gravitational potential energy gained.",
+        "difficulty": "Medium"
       }
     ]
   }
 }
-```
-
----
-
-### 3. Example `cURL` Command
-
-```bash
-curl -X POST http://localhost:5000/api/generate-questions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "topic": "Python Data Structures",
-    "description": "Lists, Dictionaries, Sets, and Tuples",
-    "count": 3,
-    "difficulty": "medium",
-    "question_type": "multiple_choice"
-  }'
 ```
