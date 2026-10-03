@@ -89,65 +89,109 @@ def generate_insights():
 
         student_name = student.get("name", "The student")
 
-        system_prompt = (
-            "You are an expert AI academic analyst and educational advisor for Edusoft. "
-            "Your task is to analyze the provided student's academic performance, grades, attendance records, "
-            "subject summaries, and trends. Generate concise, actionable, and encouraging insights strictly in valid JSON format."
+        # ----------------------------------------------------------------------
+        # PROMPT 1: Academic Summary & Key Strengths Diagnostic
+        # ----------------------------------------------------------------------
+        system_prompt_1 = (
+            "You are a senior academic diagnostic specialist for Edusoft. "
+            "Your objective is to review student performance, grades, and attendance "
+            "to produce an executive summary and highlight key academic strengths with precise metrics. "
+            "Return valid JSON only."
         )
 
-        user_prompt = f"""
-Analyze the following student data and generate analytical insights:
+        user_prompt_1 = f"""
+Analyze the student's performance data below:
 
 STUDENT PROFILE:
 {json.dumps(student, indent=2)}
 
-OVERALL SCORES & PERFORMANCE:
+OVERALL SCORES:
 {json.dumps(overall_score, indent=2)}
 
-ATTENDANCE DETAILS:
+ATTENDANCE:
 {json.dumps(attendance, indent=2)}
 
-EXAMINATIONS & SUBJECT SUMMARY:
+EXAMINATION & SUBJECT DATA:
 {json.dumps(examinations, indent=2)}
 
-Generate a response adhering strictly to this JSON format:
+Generate a JSON object with:
 {{
-  "insights": {{
-    "summary": "Brief 1-2 sentence overview of academic average, grade, and attendance health for {student_name}.",
-    "strengths": [
-      "Key positive highlight regarding attendance, top subject scores, or consistency.",
-      "Another specific academic or behavioral strength with metrics."
-    ],
-    "focus_areas": [
-      "Specific subject or area requiring improvement (e.g. lowest scoring subjects, attendance drops, or pending balances).",
-      "Actionable focus point."
-    ],
-    "recommendation": "A clear, motivational recommendation for the student/teacher/parent ahead of the upcoming term."
-  }}
+  "summary": "1-2 sentence overview mentioning {student_name}'s academic percentage, grade, and attendance status.",
+  "strengths": [
+    "Highlight strong attendance or consistency with exact %",
+    "Highlight top subject mastery with subject name, percentage, and grade"
+  ]
 }}
 """
 
-        logger.info(f"Generating insights for student: {student_name}")
+        # ----------------------------------------------------------------------
+        # PROMPT 2: Diagnostic Gap Analysis, Focus Areas & Actionable Recommendations
+        # ----------------------------------------------------------------------
+        system_prompt_2 = (
+            "You are an educational psychologist and student guidance counselor for Edusoft. "
+            "Your objective is to identify academic vulnerabilities, lowest performing subjects, attendance risks, "
+            "and create forward-looking recommendations. "
+            "Return valid JSON only."
+        )
 
-        response = client.chat.completions.create(
+        user_prompt_2 = f"""
+Analyze the student's areas of growth based on the data below:
+
+STUDENT PROFILE:
+{json.dumps(student, indent=2)}
+
+OVERALL SCORES & ATTENDANCE:
+{json.dumps(overall_score, indent=2)}
+{json.dumps(attendance, indent=2)}
+
+EXAMINATIONS & SUBJECT BREAKDOWN:
+{json.dumps(examinations, indent=2)}
+
+Generate a JSON object with:
+{{
+  "focus_areas": [
+    "Specific subject or metric requiring improvement with exact percentages",
+    "Another critical focus area (e.g., fee dues, attendance gaps, or subject score drops)"
+  ],
+  "recommendation": "A clear, actionable, and encouraging recommendation for {student_name} ahead of upcoming examinations."
+}}
+"""
+
+        logger.info(f"Executing Prompt 1 (Summary & Strengths) for: {student_name}")
+        resp1 = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": system_prompt_1},
+                {"role": "user", "content": user_prompt_1}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.5
+        )
+
+        logger.info(f"Executing Prompt 2 (Focus Areas & Recommendations) for: {student_name}")
+        resp2 = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt_2},
+                {"role": "user", "content": user_prompt_2}
             ],
             response_format={"type": "json_object"},
             temperature=0.6
         )
 
-        raw_content = response.choices[0].message.content
-        logger.info("Successfully generated student insights from OpenAI")
+        # Parse both responses
+        res1_json = json.loads(resp1.choices[0].message.content)
+        res2_json = json.loads(resp2.choices[0].message.content)
 
-        try:
-            parsed_result = json.loads(raw_content)
-            # Ensure insights key exists
-            insights = parsed_result.get("insights", parsed_result)
-        except json.JSONDecodeError:
-            insights = {"summary": raw_content, "strengths": [], "focus_areas": [], "recommendation": ""}
+        # Merge insights
+        insights = {
+            "summary": res1_json.get("summary", ""),
+            "strengths": res1_json.get("strengths", []),
+            "focus_areas": res2_json.get("focus_areas", []),
+            "recommendation": res2_json.get("recommendation", "")
+        }
+
+        logger.info(f"Successfully generated two-stage insights for student: {student_name}")
 
         return jsonify({
             "status": "success",
