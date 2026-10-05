@@ -135,26 +135,43 @@ Generate a JSON object with:
         )
 
         user_prompt_2 = f"""
-Analyze the student's areas of growth based on the data below:
+Analyze the student's areas of growth based ONLY on the supplied data.
 
 STUDENT PROFILE:
 {json.dumps(student, indent=2)}
 
-OVERALL SCORES & ATTENDANCE:
+OVERALL SCORES:
 {json.dumps(overall_score, indent=2)}
+
+ATTENDANCE:
 {json.dumps(attendance, indent=2)}
 
 EXAMINATIONS & SUBJECT BREAKDOWN:
 {json.dumps(examinations, indent=2)}
 
-Generate a JSON object with:
+IMPORTANT DATA RULES:
+- Use ONLY information present above.
+- Do NOT invent any information.
+- Do NOT mention fee dues unless fee information is explicitly provided.
+- Do NOT create subjects that are not present.
+- Do NOT create marks or percentages that are not present.
+- Do NOT infer a student's financial status.
+- Every percentage mentioned must match the supplied data.
+- Focus areas must be based on actual weaknesses in the supplied academic
+  or attendance data.
+- Recommendations must be based on the actual student performance.
+
+Generate:
+
 {{
   "focus_areas": [
-    "Specific subject or metric requiring improvement with exact percentages",
-    "Another critical focus area (e.g., fee dues, attendance gaps, or subject score drops)"
+    "Specific subject or metric requiring improvement with exact percentage",
+    "Another actual academic or attendance focus area if supported by the data"
   ],
-  "recommendation": "A clear, actionable, and encouraging recommendation for {student_name} ahead of upcoming examinations."
+  "recommendation": "A clear, actionable, encouraging recommendation based only on the supplied data."
 }}
+
+Return valid JSON only.
 """
 
         logger.info(f"Executing Prompt 1 (Summary & Strengths) for: {student_name}")
@@ -191,10 +208,15 @@ Generate a JSON object with:
             "recommendation": res2_json.get("recommendation", "")
         }
 
+        # Build full data payload preserving student, overall_score, attendance, examinations
+        response_data = dict(payload)
+        response_data["insights"] = insights
+
         logger.info(f"Successfully generated two-stage insights for student: {student_name}")
 
         return jsonify({
             "status": "success",
+            "data": response_data,
             "insights": insights
         }), 200
 
