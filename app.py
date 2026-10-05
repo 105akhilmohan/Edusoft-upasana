@@ -398,153 +398,102 @@ def generate_questions():
         if exclude_questions and isinstance(exclude_questions, list):
             context_parts.append(f"Exclude These Previously Generated Questions (Do not repeat):\n  - " + "\n  - ".join([str(q) for q in exclude_questions[:10]]))
         
-        context_str = "\n".join(context_parts)
+        # Dynamically build disallowed subjects list excluding the current subject
+        all_common_subjects = [
+            "Mathematics", "Physics", "Chemistry", "Biology", "General Science",
+            "History", "Geography", "Civics", "Social Science", "Economics",
+            "English Language", "Malayalam", "Hindi", "Computer Science", "General Knowledge"
+        ]
+        disallowed_subjects = [s for s in all_common_subjects if s.lower() not in subject_name.lower() and subject_name.lower() not in s.lower()]
+        disallowed_formatted = "\n- ".join(disallowed_subjects)
 
-        system_prompt = """
-You are an expert school curriculum designer and examination question
-generator for Edusoft.
+        # Grade-level cognitive syllabus guidance
+        class_str_clean = str(class_name).lower().replace("class", "").replace("grade", "").strip()
+        if class_str_clean in ["1", "i", "first", "one"]:
+            grade_guidance = (
+                "CRITICAL CLASS LEVEL CONSTRAINT (CLASS 1 - PRIMARY SCHOOL / AGE 5-6):\n"
+                "- Questions MUST be extremely simple elementary school level suitable for a 6-year-old child.\n"
+                "- For Mathematics: Single-digit addition and subtraction (e.g., 4 + 3 = ?, 7 - 2 = ?), counting objects (1 to 20), simple patterns, recognizing basic numbers and shapes (circle, square, triangle).\n"
+                "- STRICTLY FORBIDDEN: Physics, Optics, Lens formulas, Newton's Laws, Kinetic Energy, Vectors, Friction, Chemistry, Biology, high-school algebra, and advanced formulas. Any question containing secondary school terminology will be rejected immediately.\n"
+            )
+        elif class_str_clean in ["2", "ii", "second", "two"]:
+            grade_guidance = (
+                "CRITICAL CLASS LEVEL CONSTRAINT (CLASS 2 - PRIMARY SCHOOL / AGE 6-7):\n"
+                "- Questions MUST be simple elementary level: addition/subtraction up to 2-digit numbers (within 100), basic skip counting, simple word problems with toys/fruits/candies.\n"
+                "- STRICTLY FORBIDDEN: Secondary/high school physics, chemistry, biology, or advanced mechanics.\n"
+            )
+        elif class_str_clean in ["3", "iii", "third", "three"]:
+            grade_guidance = (
+                "CRITICAL CLASS LEVEL CONSTRAINT (CLASS 3 - PRIMARY SCHOOL / AGE 7-8):\n"
+                "- Questions MUST be elementary school level: basic multiplication tables, simple division, elementary place value, basic word problems.\n"
+            )
+        elif class_str_clean in ["4", "iv", "fourth", "5", "v", "fifth"]:
+            grade_guidance = (
+                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS {class_name} - PRIMARY SCHOOL):\n"
+                "- Questions MUST strictly follow elementary primary school syllabus for this grade.\n"
+            )
+        else:
+            grade_guidance = f"Keep the questions strictly aligned with the standard school curriculum for Class {class_name}."
 
-Your most important rule is SUBJECT AND CHAPTER SCOPE CONTROL.
+        system_prompt = f"""
+You are an expert school curriculum designer and examination question generator for Edusoft.
 
-You MUST generate questions ONLY from the specified SUBJECT and
-specified CHAPTER(S).
+PRIMARY RULE: ABSOLUTE SUBJECT, CHAPTER, AND CLASS/GRADE LEVEL COMPLIANCE.
+
+You MUST generate questions strictly matching:
+- SUBJECT: {subject_name}
+- CHAPTER(S): {chapters_formatted}
+- CLASS LEVEL: Class {class_name}
 
 STRICT SCOPE RULES:
-
-1. The provided subject_name is the ONLY allowed subject.
-
-2. The provided chapter names are the ONLY allowed chapters.
-
-3. Do NOT generate questions from another subject.
-
-4. Do NOT introduce concepts that belong primarily to another subject.
-
-5. Do NOT mix subjects.
-
-6. Do NOT use general knowledge if it introduces content outside the
-   specified subject/chapter.
-
-7. Every question must be directly relevant to at least one of the
-   specified chapters.
-
-8. The question, options, correct answer, and marking scheme must all
-   remain within the specified subject and chapter scope.
-
-9. If a concept could belong to multiple subjects, interpret it only
-   according to the specified subject and chapter.
-
-10. Do not change the subject.
-
-11. Do not invent a chapter that was not provided.
-
-12. Do not silently replace the requested chapter with a related chapter.
-
-13. If multiple chapters are provided, questions may come from any of
-   those chapters, but they must remain inside the provided chapter list.
-
-14. Questions must be academically appropriate for the specified class.
-
-15. For MCQs, all options must also belong to the same subject and
-   chapter context.
-
-16. For Short/Long/Numerical questions, the model answer and marking
-   scheme must also remain strictly within the same scope.
-
-17. Do not include explanations unless explicitly requested.
-
-18. Do not repeat the previously generated questions.
-
-19. Return valid JSON only.
-
-SUBJECT SCOPE HAS HIGHER PRIORITY THAN CREATIVITY.
-
-If creativity conflicts with subject/chapter restrictions, ALWAYS follow
-the subject/chapter restrictions.
+1. Every question MUST belong 100% to the subject "{subject_name}".
+2. Every question MUST belong 100% to the specified chapter(s): {chapters_formatted}.
+3. Under NO circumstances should you generate questions from any other subject (such as Science/Physics when Mathematics is requested).
+4. Do NOT attempt to camouflage questions from other subjects by merely appending the chapter name into the question text.
+5. All concepts, vocabulary, and numerical values MUST be strictly appropriate for Class {class_name}.
+6. For MCQs, all 4 options must belong to {subject_name} and the specified chapter.
+7. For Short/Long/Numerical questions, provide clear model answers and step-by-step marking schemes appropriate for Class {class_name}.
+8. Do NOT include any 'explanation' field.
+9. Do NOT repeat questions.
+10. Return strictly valid JSON only.
 """
 
         user_prompt = f"""
-Generate exactly {question_count} fresh and distinct educational
-questions using ONLY the following information:
-
-{context_str}
+Generate exactly {question_count} fresh and distinct educational questions based ONLY on the following specifications:
 
 ============================================================
-ABSOLUTE SUBJECT RESTRICTION
+TARGET SPECIFICATIONS
 ============================================================
+Class / Grade: {class_name}
+Subject: {subject_name}
+Chapter(s):
+{chapters_formatted}
+Difficulty: {difficulty}
+Question Types: {', '.join(question_types)}
+{f"Suggestions: {suggestions}" if suggestions else ""}
 
-SUBJECT:
-{subject_name}
+{grade_guidance}
 
-Every generated question MUST belong to the subject:
+============================================================
+ABSOLUTE SUBJECT & CHAPTER RESTRICTION
+============================================================
+Subject: "{subject_name}"
+Chapter(s): {chapters_formatted}
 
-"{subject_name}"
+Every generated question MUST be a pure {subject_name} question from the requested chapter(s).
 
 Do NOT generate content from:
-
-- Mathematics
-- Science
-- Social Science
-- English
-- Malayalam
-- Hindi
-- Computer Science
-- General Knowledge
-- or any other subject
-
-unless that content is explicitly part of the requested subject and
-chapter.
-
-============================================================
-ABSOLUTE CHAPTER RESTRICTION
-============================================================
-
-ONLY these chapter(s) are allowed:
-
-{chapters_formatted}
-
-Every question MUST be traceable to one of these chapters.
-
-If a question cannot clearly be associated with one of the above
-chapters, DO NOT generate that question.
+- {disallowed_formatted}
 
 ============================================================
 QUESTION GENERATION RULES
 ============================================================
-
 - Generate exactly {question_count} questions.
-- Use only the requested subject.
-- Use only the requested chapters.
-- Keep the academic level appropriate for class {class_name}.
-- Cover different concepts within the allowed chapters.
-- Avoid repeating the same question pattern.
-- Use different wording and scenarios.
-- For MCQs, generate four plausible options.
-- Do not create distractors from another subject.
-- For Short questions, provide a correct model answer.
-- For Long questions, provide a complete model answer.
-- For Numerical questions, use appropriate calculations only if
-  numerical problems are actually part of the requested subject/chapter.
-- Do not add explanations.
-- Do not add information from unrelated chapters.
-- Do not add information from unrelated subjects.
-
-============================================================
-FINAL SCOPE CHECK
-============================================================
-
-Before returning the response, internally verify every question:
-
-[ ] Correct subject
-[ ] Correct chapter
-[ ] Correct class level
-[ ] No unrelated subject content
-[ ] No unrelated chapter content
-[ ] Answer belongs to the same subject
-[ ] Options belong to the same subject
-[ ] Marking scheme belongs to the same subject
-[ ] No repeated question
-
-If any question fails these checks, replace it with a valid question.
+- Distribute across the requested types: {', '.join(question_types)}.
+- For MCQs: 4 plausible options strictly within {subject_name}.
+- For Numerical: Realistic calculations strictly appropriate for Class {class_name}.
+- For Short/Long: Complete model answers and step marking.
+- Do NOT include any 'explanation' field.
 
 Return a valid JSON object matching this schema:
 {{
@@ -560,7 +509,7 @@ Return a valid JSON object matching this schema:
       "type": "MCQ | Short | Long | Numerical",
       "marks": 2,
       "question": "Question text here",
-      "options": ["A) ...", "B) ...", "C) ...", "D) ..."], // empty array [] if not MCQ
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
       "correct_answer": "Correct answer or model answer",
       "step_marking": [
         {{
@@ -583,8 +532,8 @@ Return a valid JSON object matching this schema:
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.88,
-            top_p=0.95
+            temperature=0.35,
+            top_p=0.9
         )
 
         raw_content = response.choices[0].message.content
