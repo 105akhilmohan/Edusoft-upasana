@@ -1,5 +1,7 @@
 import os
+import io
 import json
+import base64
 import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -41,11 +43,12 @@ def index():
     return jsonify({
         "service": "Edusoft AI Analytics & Question Generator API",
         "status": "online",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "endpoints": {
             "health": "GET /health",
             "generate_insights": "POST /api/generate-insights",
-            "generate_questions": "POST /api/generate-questions"
+            "generate_questions": "POST /api/generate-questions",
+            "extract_syllabus": "POST /api/extract-syllabus"
         }
     }), 200
 
@@ -620,6 +623,169 @@ Return JSON with "questions" array. Do NOT include explanations.
             "status": "success",
             "data": response_payload
         }), 200
+
+    except OpenAIError as oe:
+        logger.error(f"OpenAI API Error: {str(oe)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": "OpenAI API Error",
+            "details": str(oe)
+        }), 502
+    except Exception as e:
+        logger.error(f"Internal Server Error: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": "Internal Server Error",
+            "details": str(e)
+        }), 500
+
+
+# ==============================================================================
+# 3. SYLLABUS PDF EXTRACTION & PARSING ENDPOINT (pdfplumber + OpenAI)
+# ==============================================================================
+@app.route("/api/extract-syllabus", methods=["POST"])
+@app.route("/extract-syllabus", methods=["POST"])
+@app.route("/api/parse-syllabus-pdf", methods=["POST"])
+def extract_syllabus():
+    """
+    Extract text from uploaded PDF using pdfplumber and generate structured
+    syllabus overview, chapter list with descriptions, and learning outcomes.
+    """
+    try:
+        subject_name = ""
+        subject_code = ""
+        pdf_stream = None
+        extracted_text = ""
+
+        # Case 1: multipart/form-data upload
+        if request.files:
+            file_obj = request.files.get("file") or request.files.get("pdf") or request.files.get("document")
+            if file_obj:
+                pdf_stream = io.BytesIO(file_obj.read())
+            subject_name = request.form.get("subject_name", "").strip()
+            subject_code = request.form.get("subject_code", "").strip()
+
+        # Case 2: JSON payload (base64, direct text, or URL)
+        elif request.is_json:
+            data = request.get_json() or {}
+            subject_name = str(data.get("subject_name", "")).strip()
+            subject_code = str(data.get("subject_code", "")).strip()
+
+            if "pdf_base64" in data or "file_base64" in data or "pdf" in data:
+                b64_str = data.get("pdf_base64") or data.get("file_base64") or data.get("pdf")
+                if "," in b64_str:
+                    b64_str = b64_str.split(",", 1)[1]
+                try:
+                    pdf_bytes = base64.b64decode(b64_str)
+                    pdf_stream = io.BytesIO(pdf_bytes)
+                except Exception as b64_err:
+                    return jsonify({
+                        "status": "error",
+                        "message": f"Failed to decode base64 PDF: {str(b64_err)}"
+                    }), 400
+            elif "pdf_text" in data or "text" in data or "content" in data:
+                extracted_text = str(data.get("pdf_text") or data.get("text") or data.get("content")).strip()
+
+        # Extract text using pdfplumber if we have a PDF stream
+        if pdf_stream:
+            try:
+                import pdfplumber
+                page_texts = []
+                with pdfplumber.open(pdf_stream) as pdf:
+                    for page_num, page in enumerate(pdf.pages, start=1):
+                        txt = page.extract_text()
+                        if txt and txt.strip():
+                            page_texts.append(f"--- PAGE {page_num} ---\n{txt.strip()}")
+                extracted_text = "\n\n".join(page_texts)
+            except Exception as pdf_err:
+                logger.error(f"Error parsing PDF with pdfplumber: {str(pdf_err)}", exc_info=True)
+                return jsonify({
+                    "status": "error",
+                    "message": f"Error parsing PDF file: {str(pdf_err)}"
+                }), 400
+
+        if not extracted_text:
+            return jsonify({
+                "status": "error",
+                "message": "No readable text could be extracted from the provided PDF file. Please ensure a valid PDF is uploaded."
+            }), 400
+
+        logger.info(f"Extracted {len(extracted_text)} characters from PDF for Subject: '{subject_name}' ({subject_code})")
+
+        # Trim extracted text to 80,000 characters if exceedingly large
+        truncated_text = extracted_text[:80000]
+
+        system_prompt = (
+            "You are an expert curriculum and syllabus extraction specialist. "
+            "Your objective is to analyze the provided extracted PDF document text for the specified subject and subject code, "
+            "and extract a clean, complete, structured syllabus curriculum.\n"
+            "Include:\n"
+            "1. 'syllabus_content': A concise 2-3 sentence executive overview of the subject curriculum and its core scope.\n"
+            "2. 'chapters': An ordered list of all chapters/units with 'chapter_no', 'chapter_name', and a comprehensive 'description' of topics covered.\n"
+            "3. 'learning_outcomes': An array of key academic and practical learning outcomes.\n"
+            "Output strictly valid JSON matching the exact schema."
+        )
+
+        user_prompt = f"""
+Analyze the following extracted PDF text and extract the structured syllabus for:
+Subject Name: {subject_name}
+Subject Code: {subject_code}
+
+============================================================
+EXTRACTED PDF DOCUMENT TEXT (via pdfplumber):
+============================================================
+{truncated_text}
+
+============================================================
+REQUIRED JSON OUTPUT SCHEMA:
+============================================================
+{{
+  "status": "success",
+  "subject_name": "{subject_name}",
+  "subject_code": "{subject_code}",
+  "syllabus_content": "Detailed overview of human anatomical systems, osteology, arthrology, myology, and systemic organ relations for clinical practice.",
+  "chapters": [
+    {{
+      "chapter_no": "1",
+      "chapter_name": "Introduction to Anatomical Terms & Organization",
+      "description": "Anatomical planes, positions, cavities, cell structure, tissues, and membranes."
+    }},
+    {{
+      "chapter_no": "2",
+      "chapter_name": "The Skeletal & Muscular System",
+      "description": "Axial and appendicular skeleton, joints, muscle classification, and biomechanics."
+    }}
+  ],
+  "learning_outcomes": [
+    "Identify anatomical landmarks on human models and radiographic images",
+    "Correlate anatomical structures with nursing procedures and clinical interventions"
+  ]
+}}
+"""
+
+        model = request.form.get("model") if request.files else (request.get_json() or {}).get("model", DEFAULT_MODEL)
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2
+        )
+
+        raw_output = response.choices[0].message.content
+        parsed_result = json.loads(raw_output)
+
+        # Guarantee status, subject_name, subject_code fields
+        parsed_result["status"] = "success"
+        if subject_name and not parsed_result.get("subject_name"):
+            parsed_result["subject_name"] = subject_name
+        if subject_code and not parsed_result.get("subject_code"):
+            parsed_result["subject_code"] = subject_code
+
+        return jsonify(parsed_result), 200
 
     except OpenAIError as oe:
         logger.error(f"OpenAI API Error: {str(oe)}", exc_info=True)

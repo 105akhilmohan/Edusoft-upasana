@@ -6,7 +6,7 @@ services:
     container_name: edusoft_question_generator
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "8002:5000"
     env_file:
       - .env
     environment:
