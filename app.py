@@ -763,7 +763,12 @@ REQUIRED JSON OUTPUT SCHEMA:
 }}
 """
 
-        model = request.form.get("model") if request.files else (request.get_json() or {}).get("model", DEFAULT_MODEL)
+        if request.files:
+            model = request.form.get("model") or DEFAULT_MODEL or "gpt-4o-mini"
+        elif request.is_json:
+            model = (request.get_json() or {}).get("model") or DEFAULT_MODEL or "gpt-4o-mini"
+        else:
+            model = DEFAULT_MODEL or "gpt-4o-mini"
 
         response = client.chat.completions.create(
             model=model,
