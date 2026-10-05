@@ -180,12 +180,16 @@ EXAMINATION & SUBJECT DATA:
 {json.dumps(examinations, indent=2)}
 {extra_str}
 
+SPECIAL RULES FOR NEW/INITIAL STUDENTS (0 working days or 0 exams):
+- If total_working_days is 0 or no attendance is recorded, state that attendance logging has just begun or is pending. Do NOT treat 0 working days as attendance failure or 0% critical absent.
+- If exams_count is 0 or no exam data exists, state that academic assessments are pending for the term. Do NOT treat 0 exams as Grade F failure.
+
 Generate a JSON object with:
 {{
-  "summary": "1-2 sentence overview mentioning {student_name}'s academic percentage, grade, and attendance status.",
+  "summary": "1-2 sentence overview mentioning {student_name}'s academic status, grade, and attendance standing (or pending assessment status if newly enrolled).",
   "strengths": [
-    "Highlight strong attendance or consistency with exact %",
-    "Highlight top subject mastery with subject name, percentage, and grade"
+    "Highlight strong attendance or consistency with exact % (or positive behavioral/enrollment status if newly enrolled)",
+    "Highlight top subject mastery with subject name, percentage, and grade (or general positive orientation if assessments are pending)"
   ]
 }}
 """
@@ -219,20 +223,20 @@ EXAMINATIONS & SUBJECT BREAKDOWN:
 IMPORTANT DATA RULES:
 - Use ONLY information present above.
 - Do NOT invent any information.
-- Do NOT mention fee dues unless fee information is explicitly provided with an unpaid balance.
+- Do NOT mention fee dues unless fee information is explicitly provided with an unpaid balance > 0.
 - Do NOT create subjects that are not present.
 - Do NOT create marks or percentages that are not present.
 - Do NOT infer a student's financial status.
+- If total_working_days is 0 or exams_count is 0, focus on establishing baseline attendance and preparing for initial assessments rather than penalizing for missing data.
 - Every percentage mentioned must match the supplied data.
-- Focus areas must be based on actual weaknesses in the supplied academic
-  or attendance data.
-- Recommendations must be based on the actual student performance.
+- Focus areas must be based on actual weaknesses in the supplied academic or attendance data.
+- Recommendations must be constructive and tailored to the actual student performance or enrollment stage.
 
 Generate:
 
 {{
   "focus_areas": [
-    "Specific subject or metric requiring improvement with exact percentage",
+    "Specific subject or metric requiring improvement with exact percentage (or baseline focus for initial term)",
     "Another actual academic or attendance focus area if supported by the data"
   ],
   "recommendation": "A clear, actionable, encouraging recommendation based only on the supplied data."
