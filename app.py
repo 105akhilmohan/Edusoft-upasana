@@ -398,39 +398,69 @@ def generate_questions():
         if exclude_questions and isinstance(exclude_questions, list):
             context_parts.append(f"Exclude These Previously Generated Questions (Do not repeat):\n  - " + "\n  - ".join([str(q) for q in exclude_questions[:10]]))
         
-        # Dynamically build disallowed subjects list excluding the current subject
+        # Subject normalization and alias matching
+        def is_same_subject(subj_a, subj_b):
+            a = subj_a.lower().strip()
+            b = subj_b.lower().strip()
+            if a == b or a in b or b in a:
+                return True
+            # Mathematics aliases
+            math_terms = ["math", "maths", "mathematics", "arithmetic", "algebra", "geometry", "calculus", "trigonometry", "statistics"]
+            if any(term == a or a.startswith(term) for term in math_terms) and any(term == b or b.startswith(term) for term in math_terms):
+                return True
+            # Science aliases
+            sci_terms = ["science", "gen science", "general science", "evs", "environmental science", "environmental studies"]
+            if any(term in a for term in sci_terms) and any(term in b for term in sci_terms):
+                return True
+            # Social Science aliases
+            soc_terms = ["social", "social science", "social studies", "sst", "history", "geography", "civics", "political science", "economics"]
+            if any(term in a for term in soc_terms) and any(term in b for term in soc_terms):
+                return True
+            # Language aliases
+            if ("english" in a and "english" in b) or ("hindi" in a and "hindi" in b) or ("malayalam" in a and "malayalam" in b):
+                return True
+            # Computer aliases
+            comp_terms = ["computer", "computer science", "cs", "information technology", "it", "informatics"]
+            if any(term in a for term in comp_terms) and any(term in b for term in comp_terms):
+                return True
+            return False
+
+        # Dynamically build disallowed subjects list strictly excluding the current subject
         all_common_subjects = [
             "Mathematics", "Physics", "Chemistry", "Biology", "General Science",
             "History", "Geography", "Civics", "Social Science", "Economics",
             "English Language", "Malayalam", "Hindi", "Computer Science", "General Knowledge"
         ]
-        disallowed_subjects = [s for s in all_common_subjects if s.lower() not in subject_name.lower() and subject_name.lower() not in s.lower()]
+        disallowed_subjects = [s for s in all_common_subjects if not is_same_subject(s, subject_name)]
         disallowed_formatted = "\n- ".join(disallowed_subjects)
 
         # Grade-level cognitive syllabus guidance
         class_str_clean = str(class_name).lower().replace("class", "").replace("grade", "").strip()
         if class_str_clean in ["1", "i", "first", "one"]:
             grade_guidance = (
-                "CRITICAL CLASS LEVEL CONSTRAINT (CLASS 1 - PRIMARY SCHOOL / AGE 5-6):\n"
-                "- Questions MUST be extremely simple elementary school level suitable for a 6-year-old child.\n"
-                "- For Mathematics: Single-digit addition and subtraction (e.g., 4 + 3 = ?, 7 - 2 = ?), counting objects (1 to 20), simple patterns, recognizing basic numbers and shapes (circle, square, triangle).\n"
-                "- STRICTLY FORBIDDEN: Physics, Optics, Lens formulas, Newton's Laws, Kinetic Energy, Vectors, Friction, Chemistry, Biology, high-school algebra, and advanced formulas. Any question containing secondary school terminology will be rejected immediately.\n"
+                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS 1 - PRIMARY SCHOOL / AGE 5-6):\n"
+                f"- Questions MUST be extremely simple elementary school level suitable for a 6-year-old child in Class 1.\n"
+                f"- For Mathematics/Maths: Single-digit addition and subtraction (e.g. 4 + 3 = ?, 7 - 2 = ?), counting objects (1 to 20), simple patterns, recognizing basic shapes (circle, square, triangle).\n"
+                f"- For Science/EVS: Identifying domestic vs wild animals, plants/leaves, parts of the body, primary colors, weather/seasons.\n"
+                f"- For English/Languages: Simple phonics, alphabet sounds, rhyming words, naming common everyday objects (cat, sun, book).\n"
+                f"- STRICTLY FORBIDDEN: Physics, Optics, Lens formulas, Newton's Laws, Kinetic Energy, Vectors, Friction, Chemistry, secondary-school algebra, or secondary terminology. Any question containing concepts above Class 1 will be rejected immediately.\n"
             )
         elif class_str_clean in ["2", "ii", "second", "two"]:
             grade_guidance = (
-                "CRITICAL CLASS LEVEL CONSTRAINT (CLASS 2 - PRIMARY SCHOOL / AGE 6-7):\n"
-                "- Questions MUST be simple elementary level: addition/subtraction up to 2-digit numbers (within 100), basic skip counting, simple word problems with toys/fruits/candies.\n"
-                "- STRICTLY FORBIDDEN: Secondary/high school physics, chemistry, biology, or advanced mechanics.\n"
+                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS 2 - PRIMARY SCHOOL / AGE 6-7):\n"
+                f"- Questions MUST be simple elementary level suitable for Class 2 students.\n"
+                f"- For Mathematics/Maths: Addition and subtraction up to 2-digit numbers (within 100), basic skip counting, simple word problems with small quantities.\n"
+                f"- STRICTLY FORBIDDEN: Secondary or high school physics, chemistry, biology, or advanced mechanics.\n"
             )
         elif class_str_clean in ["3", "iii", "third", "three"]:
             grade_guidance = (
-                "CRITICAL CLASS LEVEL CONSTRAINT (CLASS 3 - PRIMARY SCHOOL / AGE 7-8):\n"
-                "- Questions MUST be elementary school level: basic multiplication tables, simple division, elementary place value, basic word problems.\n"
+                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS 3 - PRIMARY SCHOOL / AGE 7-8):\n"
+                f"- Questions MUST be elementary school level: basic multiplication tables, simple division, elementary place value, basic word problems.\n"
             )
         elif class_str_clean in ["4", "iv", "fourth", "5", "v", "fifth"]:
             grade_guidance = (
                 f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS {class_name} - PRIMARY SCHOOL):\n"
-                "- Questions MUST strictly follow elementary primary school syllabus for this grade.\n"
+                f"- Questions MUST strictly follow elementary primary school syllabus for this grade.\n"
             )
         else:
             grade_guidance = f"Keep the questions strictly aligned with the standard school curriculum for Class {class_name}."
