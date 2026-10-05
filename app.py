@@ -307,14 +307,22 @@ Return valid JSON only.
         }), 500
 
 
+from textbook_repo import (
+    get_textbook_content,
+    validate_question,
+    normalize_text_for_comparison,
+    normalize_class,
+    normalize_subject
+)
+
 # ==============================================================================
-# 2. QUESTION GENERATION ENDPOINT (Explanation Removed)
+# 2. QUESTION GENERATION ENDPOINT (Textbook-Grounded & Strict Validation)
 # ==============================================================================
 @app.route("/api/generate-questions", methods=["POST"])
 @app.route("/generate-questions", methods=["POST"])
 def generate_questions():
     """
-    Generate educational questions for Edusoft without explanation.
+    Generate educational questions strictly grounded in textbook content with post-generation validation.
     """
     try:
         data = request.get_json()
@@ -325,8 +333,8 @@ def generate_questions():
             }), 400
 
         # Extract Fields with fallbacks
-        class_name = data.get("class_name", "")
-        subject_name = data.get("subject_name") or data.get("topic", "")
+        class_name = str(data.get("class_name", "")).strip()
+        subject_name = str(data.get("subject_name") or data.get("topic", "")).strip()
         
         # Chapters
         chapters_raw = data.get("chapters", [])
@@ -336,6 +344,14 @@ def generate_questions():
             chapters = [chapters_raw.strip()]
         else:
             chapters = []
+
+        if not subject_name and not chapters:
+            return jsonify({
+                "status": "error",
+                "message": "At least 'subject_name' (or 'topic') or 'chapters' must be provided."
+            }), 400
+
+        primary_chapter = chapters[0] if chapters else (subject_name or "General")
 
         # Question Count
         count_val = data.get("question_count") if data.get("question_count") is not None else data.get("count")
@@ -355,10 +371,8 @@ def generate_questions():
                     "message": "Field 'question_count' must be a valid integer."
                 }), 400
 
-        # Difficulty
+        # Difficulty & Question Types
         difficulty = data.get("difficulty", "Medium")
-
-        # Question Types
         q_types_raw = data.get("question_types") or data.get("question_type") or ["MCQ", "Short", "Long"]
         if isinstance(q_types_raw, list):
             question_types = [str(t).strip() for t in q_types_raw if str(t).strip()]
@@ -367,162 +381,80 @@ def generate_questions():
         else:
             question_types = ["MCQ", "Short", "Long"]
 
-        # Suggestions / Description
         suggestions = data.get("suggestions") or data.get("description", "")
-        exclude_questions = data.get("exclude_questions", [])
+        payload_content = data.get("textbook_content") or data.get("content") or data.get("chapter_content")
         model = data.get("model", DEFAULT_MODEL)
 
-        if not subject_name and not chapters:
+        # ----------------------------------------------------------------------
+        # STEP 1: RETRIEVE TEXTBOOK CONTENT (Source of Truth)
+        # ----------------------------------------------------------------------
+        textbook_content, content_id = get_textbook_content(
+            class_name=class_name,
+            subject_name=subject_name,
+            chapter_name=primary_chapter,
+            payload_content=payload_content
+        )
+
+        if not textbook_content:
+            logger.warning(f"Textbook content not found for Class='{class_name}', Subject='{subject_name}', Chapter='{primary_chapter}'")
             return jsonify({
                 "status": "error",
-                "message": "At least 'subject_name' (or 'topic') or 'chapters' must be provided."
-            }), 400
+                "message": "Textbook content not found for the selected class, subject, and chapter."
+            }), 404
 
-        # Generate a unique generation nonce to prevent deterministic repetition
+        # Logging source content metadata as required
+        logger.info(f"Generating questions: Class = {class_name}, Subject = {subject_name}, Chapter = {primary_chapter}")
+        logger.info(f"Retrieved textbook content: {content_id}, Content length = {len(textbook_content)}")
+
+        # ----------------------------------------------------------------------
+        # STEP 2: BUILD PROMPTS WITH TEXTBOOK AS ONLY SOURCE OF TRUTH
+        # ----------------------------------------------------------------------
         import uuid
         import time
         generation_nonce = f"{uuid.uuid4().hex[:8]}-{int(time.time() * 1000)}"
 
-        context_parts = []
-        if class_name:
-            context_parts.append(f"Target Class / Grade: {class_name}")
-        if subject_name:
-            context_parts.append(f"Subject / Topic: {subject_name}")
-        chapters_formatted = ("\n  - " + "\n  - ".join(chapters)) if chapters else f"All topics under {subject_name}"
-        if chapters:
-            context_parts.append(f"Chapters Covered:{chapters_formatted}")
-        context_parts.append(f"Difficulty Level: {difficulty}")
-        context_parts.append(f"Requested Question Types: {', '.join(question_types)}")
-        if suggestions:
-            context_parts.append(f"Specific Suggestions & Requirements: {suggestions}")
-        if exclude_questions and isinstance(exclude_questions, list):
-            context_parts.append(f"Exclude These Previously Generated Questions (Do not repeat):\n  - " + "\n  - ".join([str(q) for q in exclude_questions[:10]]))
-        
-        # Subject normalization and alias matching
-        def is_same_subject(subj_a, subj_b):
-            a = subj_a.lower().strip()
-            b = subj_b.lower().strip()
-            if a == b or a in b or b in a:
-                return True
-            # Mathematics aliases
-            math_terms = ["math", "maths", "mathematics", "arithmetic", "algebra", "geometry", "calculus", "trigonometry", "statistics"]
-            if any(term == a or a.startswith(term) for term in math_terms) and any(term == b or b.startswith(term) for term in math_terms):
-                return True
-            # Science aliases
-            sci_terms = ["science", "gen science", "general science", "evs", "environmental science", "environmental studies"]
-            if any(term in a for term in sci_terms) and any(term in b for term in sci_terms):
-                return True
-            # Social Science aliases
-            soc_terms = ["social", "social science", "social studies", "sst", "history", "geography", "civics", "political science", "economics"]
-            if any(term in a for term in soc_terms) and any(term in b for term in soc_terms):
-                return True
-            # Language aliases
-            if ("english" in a and "english" in b) or ("hindi" in a and "hindi" in b) or ("malayalam" in a and "malayalam" in b):
-                return True
-            # Computer aliases
-            comp_terms = ["computer", "computer science", "cs", "information technology", "it", "informatics"]
-            if any(term in a for term in comp_terms) and any(term in b for term in comp_terms):
-                return True
-            return False
-
-        # Dynamically build disallowed subjects list strictly excluding the current subject
-        all_common_subjects = [
-            "Mathematics", "Physics", "Chemistry", "Biology", "General Science",
-            "History", "Geography", "Civics", "Social Science", "Economics",
-            "English Language", "Malayalam", "Hindi", "Computer Science", "General Knowledge"
-        ]
-        disallowed_subjects = [s for s in all_common_subjects if not is_same_subject(s, subject_name)]
-        disallowed_formatted = "\n- ".join(disallowed_subjects)
-
-        # Grade-level cognitive syllabus guidance
-        class_str_clean = str(class_name).lower().replace("class", "").replace("grade", "").strip()
-        if class_str_clean in ["1", "i", "first", "one"]:
-            grade_guidance = (
-                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS 1 - PRIMARY SCHOOL / AGE 5-6):\n"
-                f"- Questions MUST be extremely simple elementary school level suitable for a 6-year-old child in Class 1.\n"
-                f"- For Mathematics/Maths: Single-digit addition and subtraction (e.g. 4 + 3 = ?, 7 - 2 = ?), counting objects (1 to 20), simple patterns, recognizing basic shapes (circle, square, triangle).\n"
-                f"- For Science/EVS: Identifying domestic vs wild animals, plants/leaves, parts of the body, primary colors, weather/seasons.\n"
-                f"- For English/Languages: Simple phonics, alphabet sounds, rhyming words, naming common everyday objects (cat, sun, book).\n"
-                f"- STRICTLY FORBIDDEN: Physics, Optics, Lens formulas, Newton's Laws, Kinetic Energy, Vectors, Friction, Chemistry, secondary-school algebra, or secondary terminology. Any question containing concepts above Class 1 will be rejected immediately.\n"
-            )
-        elif class_str_clean in ["2", "ii", "second", "two"]:
-            grade_guidance = (
-                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS 2 - PRIMARY SCHOOL / AGE 6-7):\n"
-                f"- Questions MUST be simple elementary level suitable for Class 2 students.\n"
-                f"- For Mathematics/Maths: Addition and subtraction up to 2-digit numbers (within 100), basic skip counting, simple word problems with small quantities.\n"
-                f"- STRICTLY FORBIDDEN: Secondary or high school physics, chemistry, biology, or advanced mechanics.\n"
-            )
-        elif class_str_clean in ["3", "iii", "third", "three"]:
-            grade_guidance = (
-                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS 3 - PRIMARY SCHOOL / AGE 7-8):\n"
-                f"- Questions MUST be elementary school level: basic multiplication tables, simple division, elementary place value, basic word problems.\n"
-            )
-        elif class_str_clean in ["4", "iv", "fourth", "5", "v", "fifth"]:
-            grade_guidance = (
-                f"CRITICAL CLASS LEVEL CONSTRAINT (CLASS {class_name} - PRIMARY SCHOOL):\n"
-                f"- Questions MUST strictly follow elementary primary school syllabus for this grade.\n"
-            )
-        else:
-            grade_guidance = f"Keep the questions strictly aligned with the standard school curriculum for Class {class_name}."
-
         system_prompt = f"""
 You are an expert school curriculum designer and examination question generator for Edusoft.
 
-PRIMARY RULE: ABSOLUTE SUBJECT, CHAPTER, AND CLASS/GRADE LEVEL COMPLIANCE.
-
-You MUST generate questions strictly matching:
-- SUBJECT: {subject_name}
-- CHAPTER(S): {chapters_formatted}
-- CLASS LEVEL: Class {class_name}
-
-STRICT SCOPE RULES:
-1. Every question MUST belong 100% to the subject "{subject_name}".
-2. Every question MUST belong 100% to the specified chapter(s): {chapters_formatted}.
-3. Under NO circumstances should you generate questions from any other subject (such as Science/Physics when Mathematics is requested).
-4. Do NOT attempt to camouflage questions from other subjects by merely appending the chapter name into the question text.
-5. All concepts, vocabulary, and numerical values MUST be strictly appropriate for Class {class_name}.
-6. For MCQs, all 4 options must belong to {subject_name} and the specified chapter.
-7. For Short/Long/Numerical questions, provide clear model answers and step-by-step marking schemes appropriate for Class {class_name}.
+MANDATORY RULES:
+1. The supplied textbook content is the ONLY source of truth.
+2. Every question, option, correct answer, and step marking MUST be directly and strictly derived from the provided textbook content below.
+3. Target Class Level: Class {class_name}.
+4. Target Subject: {subject_name}.
+5. Chapter: {primary_chapter}.
+6. Do NOT use outside knowledge or introduce any concepts from other subjects (e.g. absolutely no Physics/Science when generating Maths questions).
+7. For Class 1: Only simple single-digit numbers (1-20), counting, basic addition/subtraction, and shapes. NEVER use high-school physics or mechanics.
 8. Do NOT include any 'explanation' field.
-9. Do NOT repeat questions.
-10. Return strictly valid JSON only.
+9. Return strictly valid JSON only.
 """
 
         user_prompt = f"""
-Generate exactly {question_count} fresh and distinct educational questions based ONLY on the following specifications:
+Generate exactly {question_count} distinct educational questions based STRICTLY on the supplied textbook content below:
 
 ============================================================
-TARGET SPECIFICATIONS
+OFFICIAL TEXTBOOK CONTENT (ONLY SOURCE OF TRUTH)
 ============================================================
-Class / Grade: {class_name}
-Subject: {subject_name}
-Chapter(s):
-{chapters_formatted}
+{textbook_content}
+
+============================================================
+SPECIFICATIONS
+============================================================
+Target Class: {class_name}
+Target Subject: {subject_name}
+Target Chapter: {primary_chapter}
 Difficulty: {difficulty}
-Question Types: {', '.join(question_types)}
+Requested Types: {', '.join(question_types)}
 {f"Suggestions: {suggestions}" if suggestions else ""}
-
-{grade_guidance}
-
-============================================================
-ABSOLUTE SUBJECT & CHAPTER RESTRICTION
-============================================================
-Subject: "{subject_name}"
-Chapter(s): {chapters_formatted}
-
-Every generated question MUST be a pure {subject_name} question from the requested chapter(s).
-
-Do NOT generate content from:
-- {disallowed_formatted}
+Random Variation Seed: {generation_nonce}
 
 ============================================================
-QUESTION GENERATION RULES
+STRICT GENERATION RULES
 ============================================================
-- Generate exactly {question_count} questions.
-- Distribute across the requested types: {', '.join(question_types)}.
-- For MCQs: 4 plausible options strictly within {subject_name}.
-- For Numerical: Realistic calculations strictly appropriate for Class {class_name}.
-- For Short/Long: Complete model answers and step marking.
+- Generate exactly {question_count} questions answerable directly from the textbook content above.
+- Every question MUST be pure {subject_name} suitable for Class {class_name}.
+- For MCQs: 4 plausible options within the textbook scope.
+- For Numerical: Simple age-appropriate calculations.
+- For Short/Long: Model answer and step-by-step marking.
 - Do NOT include any 'explanation' field.
 
 Return a valid JSON object matching this schema:
@@ -535,7 +467,7 @@ Return a valid JSON object matching this schema:
   "questions": [
     {{
       "id": 1,
-      "chapter": "Chapter name",
+      "chapter": "{primary_chapter}",
       "type": "MCQ | Short | Long | Numerical",
       "marks": 2,
       "question": "Question text here",
@@ -553,8 +485,6 @@ Return a valid JSON object matching this schema:
 }}
 """
 
-        logger.info(f"Generating {question_count} distinct questions for '{subject_name}' ({class_name}) [Nonce: {generation_nonce}]")
-
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -562,7 +492,7 @@ Return a valid JSON object matching this schema:
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.35,
+            temperature=0.3,
             top_p=0.9
         )
 
@@ -570,11 +500,125 @@ Return a valid JSON object matching this schema:
         try:
             parsed_result = json.loads(raw_content)
         except json.JSONDecodeError:
-            parsed_result = {"raw_output": raw_content}
+            parsed_result = {"questions": []}
+
+        generated_raw_questions = parsed_result.get("questions", [])
+
+        # ----------------------------------------------------------------------
+        # STEP 3: STRICT POST-GENERATION VALIDATION & DUPLICATE DETECTION
+        # ----------------------------------------------------------------------
+        valid_questions = []
+        seen_normalized_texts = set()
+
+        for idx, q_obj in enumerate(generated_raw_questions, start=1):
+            q_text = q_obj.get("question", "")
+            norm_text = normalize_text_for_comparison(q_text)
+
+            # Duplicate Check
+            if norm_text in seen_normalized_texts:
+                logger.warning(f"Question {idx}: INVALID - Duplicate question detected ('{q_text[:50]}...')")
+                continue
+
+            # Validation against Class, Subject, Chapter & Content
+            is_valid, reason = validate_question(
+                q_obj=q_obj,
+                class_name=class_name,
+                subject_name=subject_name,
+                chapter_name=primary_chapter,
+                textbook_content=textbook_content
+            )
+
+            if is_valid:
+                logger.info(f"Question {idx}: VALID - '{q_text[:60]}...'")
+                # Enforce clean fields
+                clean_q = dict(q_obj)
+                clean_q["id"] = len(valid_questions) + 1
+                clean_q["chapter"] = primary_chapter  # Hard constraint: exact requested chapter name
+                clean_q.pop("explanation", None)       # Enforce: no explanation
+                valid_questions.append(clean_q)
+                seen_normalized_texts.add(norm_text)
+            else:
+                logger.warning(f"Question {idx}: INVALID - {reason} - '{q_text[:60]}...'")
+
+        # ----------------------------------------------------------------------
+        # STEP 4: REGENERATE REPLACEMENTS IF INVALID QUESTIONS WERE DROPPED
+        # ----------------------------------------------------------------------
+        retry_count = 0
+        max_retries = 2
+        while len(valid_questions) < question_count and retry_count < max_retries:
+            needed = question_count - len(valid_questions)
+            retry_count += 1
+            logger.info(f"Regenerating {needed} replacement question(s) (Attempt {retry_count}/{max_retries})...")
+
+            replacement_prompt = f"""
+Generate exactly {needed} fresh, distinct replacement questions based ONLY on the supplied textbook content:
+{textbook_content}
+
+Exclude already generated questions:
+{list(seen_normalized_texts)[:10]}
+
+Specifications:
+Class: {class_name}
+Subject: {subject_name}
+Chapter: {primary_chapter}
+Difficulty: {difficulty}
+Types: {', '.join(question_types)}
+
+Return JSON with "questions" array. Do NOT include explanations.
+"""
+            rep_response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": replacement_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            try:
+                rep_json = json.loads(rep_response.choices[0].message.content)
+                rep_questions = rep_json.get("questions", [])
+            except Exception:
+                rep_questions = []
+
+            for q_obj in rep_questions:
+                if len(valid_questions) >= question_count:
+                    break
+                q_text = q_obj.get("question", "")
+                norm_text = normalize_text_for_comparison(q_text)
+                if norm_text in seen_normalized_texts:
+                    continue
+                is_valid, reason = validate_question(
+                    q_obj=q_obj,
+                    class_name=class_name,
+                    subject_name=subject_name,
+                    chapter_name=primary_chapter,
+                    textbook_content=textbook_content
+                )
+                if is_valid:
+                    clean_q = dict(q_obj)
+                    clean_q["id"] = len(valid_questions) + 1
+                    clean_q["chapter"] = primary_chapter
+                    clean_q.pop("explanation", None)
+                    valid_questions.append(clean_q)
+                    seen_normalized_texts.add(norm_text)
+                    logger.info(f"Replacement Question: VALID - '{q_text[:60]}...'")
+                else:
+                    logger.warning(f"Replacement Question: INVALID - {reason}")
+
+        # Final response formatting
+        response_payload = {
+            "class_name": class_name,
+            "subject_name": subject_name,
+            "chapters": chapters,
+            "total_questions": len(valid_questions),
+            "difficulty": difficulty,
+            "questions": valid_questions
+        }
 
         return jsonify({
             "status": "success",
-            "data": parsed_result
+            "data": response_payload
         }), 200
 
     except OpenAIError as oe:
