@@ -81,13 +81,76 @@ def generate_insights():
         # Handle payload whether wrapped inside 'data' or sent directly at top-level
         payload = raw_body.get("data") if ("data" in raw_body and isinstance(raw_body["data"], dict)) else raw_body
 
-        student = payload.get("student", {})
-        overall_score = payload.get("overall_score", {})
-        attendance = payload.get("attendance", {})
-        examinations = payload.get("examinations", {})
-        model = payload.get("model", DEFAULT_MODEL)
+        # Check if flat payload format (e.g. PHP $ai_payload)
+        if "student_name" in payload or "student_id" in payload or "academic_percentage" in payload:
+            student = {
+                "id": payload.get("student_id") or payload.get("id"),
+                "name": payload.get("student_name") or payload.get("name", "The student"),
+                "admission_no": payload.get("admission_no", ""),
+                "roll_no": payload.get("roll_no", ""),
+                "class": payload.get("class", ""),
+                "section": payload.get("section", ""),
+                "gender": payload.get("gender", "")
+            }
+            overall_score = {
+                "composite_score": payload.get("composite_score"),
+                "performance_label": payload.get("performance_label", ""),
+                "academic_percentage": payload.get("academic_percentage"),
+                "academic_grade": payload.get("academic_grade", ""),
+                "attendance_percentage": payload.get("attendance_percentage"),
+                "attendance_health": payload.get("attendance_health", "")
+            }
+            attendance = {
+                "total_working_days": payload.get("total_working_days"),
+                "present": payload.get("present_days") if payload.get("present_days") is not None else payload.get("present"),
+                "absent": payload.get("absent_days") if payload.get("absent_days") is not None else payload.get("absent"),
+                "late": payload.get("late_days") if payload.get("late_days") is not None else payload.get("late"),
+                "half_day": payload.get("half_days") if payload.get("half_days") is not None else payload.get("half_day"),
+                "percentage": payload.get("attendance_percentage"),
+                "health_status": payload.get("attendance_health", "")
+            }
+            examinations = {
+                "exams_count": payload.get("exams_count"),
+                "overall_percentage": payload.get("academic_percentage"),
+                "overall_grade": payload.get("academic_grade", ""),
+                "subject_summary": payload.get("subject_summary", []),
+                "top_subjects": payload.get("top_subjects", []),
+                "lowest_subjects": payload.get("lowest_subjects", [])
+            }
+            extra_info = {}
+            if payload.get("fee_status") is not None or payload.get("fee_balance") is not None:
+                extra_info["fee_info"] = {
+                    "fee_status": payload.get("fee_status"),
+                    "fee_balance": payload.get("fee_balance")
+                }
+            if payload.get("behavior_points") is not None or payload.get("incident_count") is not None:
+                extra_info["behavior_and_discipline"] = {
+                    "behavior_points": payload.get("behavior_points"),
+                    "incident_count": payload.get("incident_count")
+                }
+        else:
+            student = payload.get("student", {})
+            overall_score = payload.get("overall_score", {})
+            attendance = payload.get("attendance", {})
+            examinations = payload.get("examinations", {})
+            extra_info = {}
+            if "fee_info" in payload:
+                extra_info["fee_info"] = payload.get("fee_info")
+            elif "fee_balance" in payload or "fee_status" in payload:
+                extra_info["fee_info"] = {
+                    "fee_status": payload.get("fee_status"),
+                    "fee_balance": payload.get("fee_balance")
+                }
+            if "discipline" in payload:
+                extra_info["behavior_and_discipline"] = payload.get("discipline")
+            elif "behavior_points" in payload or "incident_count" in payload:
+                extra_info["behavior_and_discipline"] = {
+                    "behavior_points": payload.get("behavior_points"),
+                    "incident_count": payload.get("incident_count")
+                }
 
-        student_name = student.get("name", "The student")
+        model = payload.get("model", DEFAULT_MODEL)
+        student_name = student.get("name") or payload.get("student_name", "The student")
 
         # ----------------------------------------------------------------------
         # PROMPT 1: Academic Summary & Key Strengths Diagnostic
@@ -98,6 +161,8 @@ def generate_insights():
             "to produce an executive summary and highlight key academic strengths with precise metrics. "
             "Return valid JSON only."
         )
+
+        extra_str = f"\nADDITIONAL METRICS:\n{json.dumps(extra_info, indent=2)}" if extra_info else ""
 
         user_prompt_1 = f"""
 Analyze the student's performance data below:
@@ -113,6 +178,7 @@ ATTENDANCE:
 
 EXAMINATION & SUBJECT DATA:
 {json.dumps(examinations, indent=2)}
+{extra_str}
 
 Generate a JSON object with:
 {{
@@ -148,11 +214,12 @@ ATTENDANCE:
 
 EXAMINATIONS & SUBJECT BREAKDOWN:
 {json.dumps(examinations, indent=2)}
+{extra_str}
 
 IMPORTANT DATA RULES:
 - Use ONLY information present above.
 - Do NOT invent any information.
-- Do NOT mention fee dues unless fee information is explicitly provided.
+- Do NOT mention fee dues unless fee information is explicitly provided with an unpaid balance.
 - Do NOT create subjects that are not present.
 - Do NOT create marks or percentages that are not present.
 - Do NOT infer a student's financial status.
