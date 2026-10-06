@@ -4,6 +4,8 @@ import re
 import json
 import base64
 import logging
+import tempfile
+import gc
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -665,17 +667,22 @@ def extract_page_lines_reading_order(page, page_num):
     """
     Extract words from a pdfplumber page using bounding-box coordinates to reconstruct
     natural reading order, handle two-column vs single-column layouts, and repair line-break hyphens.
+    Optimized for low-memory footprint on large textbooks.
     """
     try:
         words = page.extract_words(
             x_tolerance=3,
             y_tolerance=3,
             keep_blank_chars=False,
-            use_text_flow=True
+            use_text_flow=False,
+            extra_attrs=[]
         )
     except Exception as e:
         logger.warning(f"extract_words failed on page {page_num}: {e}. Falling back to extract_text.")
-        raw_text = page.extract_text() or ""
+        try:
+            raw_text = page.extract_text() or ""
+        except Exception:
+            raw_text = ""
         return [l.strip() for l in raw_text.splitlines() if l.strip()]
 
     if not words:
@@ -1117,11 +1124,12 @@ def extract_syllabus():
     Extract text from uploaded full textbook or syllabus PDF using pdfplumber,
     reconstruct coordinate reading order, clean headers/footers, detect chapters
     via Table of Contents, map exact chapter boundaries, and preserve 100% full chapter content.
+    Uses disk-backed streaming and aggressive memory reclamation to prevent OOM on 600+ page books.
     """
+    temp_pdf_path = None
     try:
         subject_name = ""
         subject_code = ""
-        pdf_stream = None
         extracted_text = ""
         raw_page_records = []
         total_pages = 0
@@ -1131,7 +1139,9 @@ def extract_syllabus():
         if request.files:
             file_obj = request.files.get("file") or request.files.get("pdf") or request.files.get("document")
             if file_obj:
-                pdf_stream = io.BytesIO(file_obj.read())
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    temp_pdf_path = tmp.name
+                    file_obj.save(tmp.name)
             subject_name = request.form.get("subject_name", "").strip()
             subject_code = request.form.get("subject_code", "").strip()
             model = request.form.get("model") or DEFAULT_MODEL or "gpt-4o-mini"
@@ -1149,7 +1159,11 @@ def extract_syllabus():
                     b64_str = b64_str.split(",", 1)[1]
                 try:
                     pdf_bytes = base64.b64decode(b64_str)
-                    pdf_stream = io.BytesIO(pdf_bytes)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        temp_pdf_path = tmp.name
+                        tmp.write(pdf_bytes)
+                    del pdf_bytes
+                    gc.collect()
                 except Exception as b64_err:
                     return jsonify({
                         "status": "error",
@@ -1162,14 +1176,18 @@ def extract_syllabus():
             model = DEFAULT_MODEL or "gpt-4o-mini"
 
         # Step 1: Extract all pages with bounding-box coordinate reading order
-        if pdf_stream:
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
             try:
                 import pdfplumber
-                with pdfplumber.open(pdf_stream) as pdf:
+                with pdfplumber.open(temp_pdf_path) as pdf:
                     total_pages = len(pdf.pages)
                     logger.info(f"Total PDF pages: {total_pages}")
                     for page_num, page in enumerate(pdf.pages, start=1):
                         lines = extract_page_lines_reading_order(page, page_num)
+                        try:
+                            page.flush_cache()
+                        except Exception:
+                            pass
                         if lines:
                             clean_t = "\n".join(lines).strip()
                             raw_page_records.append({
@@ -1178,6 +1196,10 @@ def extract_syllabus():
                                 "lines": lines
                             })
                             pages_with_text += 1
+
+                        # Periodic garbage collection for large textbooks
+                        if page_num % 25 == 0:
+                            gc.collect()
 
             except Exception as pdf_err:
                 logger.error(f"Error parsing PDF with pdfplumber: {str(pdf_err)}", exc_info=True)
@@ -1290,6 +1312,13 @@ def extract_syllabus():
             "message": "Internal Server Error",
             "details": str(e)
         }), 500
+    finally:
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            try:
+                os.remove(temp_pdf_path)
+            except Exception:
+                pass
+        gc.collect()
 
 
 if __name__ == "__main__":
