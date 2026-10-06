@@ -819,9 +819,6 @@ def extract_syllabus():
         chunks = chunk_pdf_pages(page_records, max_chunk_chars=40000)
         logger.info(f"Formed {len(chunks)} chunk(s) for extraction.")
 
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-
         # ======================================================================
         # PATH A: SINGLE CHUNK (Small/Medium PDF)
         # ======================================================================
@@ -889,10 +886,6 @@ REQUIRED JSON OUTPUT SCHEMA:
             raw_output = response.choices[0].message.content
             parsed_result = json.loads(raw_output)
 
-            if hasattr(response, "usage") and response.usage:
-                total_prompt_tokens += (response.usage.prompt_tokens or 0)
-                total_completion_tokens += (response.usage.completion_tokens or 0)
-
         # ======================================================================
         # PATH B: MULTI-CHUNK SEQUENTIAL EXTRACTION & AGGREGATION (Large PDF / Book)
         # ======================================================================
@@ -953,11 +946,6 @@ JSON OUTPUT SCHEMA:
                         temperature=0.2
                     )
                     chunk_parsed = json.loads(chunk_resp.choices[0].message.content)
-
-                    if hasattr(chunk_resp, "usage") and chunk_resp.usage:
-                        total_prompt_tokens += (chunk_resp.usage.prompt_tokens or 0)
-                        total_completion_tokens += (chunk_resp.usage.completion_tokens or 0)
-
                     extracted_ch = chunk_parsed.get("chapters", [])
                     extracted_lo = chunk_parsed.get("learning_outcomes", [])
 
@@ -1039,26 +1027,8 @@ REQUIRED FINAL JSON OUTPUT SCHEMA:
             )
             parsed_result = json.loads(agg_response.choices[0].message.content)
 
-            if hasattr(agg_response, "usage") and agg_response.usage:
-                total_prompt_tokens += (agg_response.usage.prompt_tokens or 0)
-                total_completion_tokens += (agg_response.usage.completion_tokens or 0)
-
-        # Calculate exact token usage and extraction cost
-        total_tokens = total_prompt_tokens + total_completion_tokens
-        if "gpt-4o-mini" in str(model).lower():
-            cost_usd = (total_prompt_tokens * 0.15 + total_completion_tokens * 0.60) / 1_000_000
-        elif "gpt-4o" in str(model).lower():
-            cost_usd = (total_prompt_tokens * 2.50 + total_completion_tokens * 10.00) / 1_000_000
-        else:
-            cost_usd = (total_prompt_tokens * 0.15 + total_completion_tokens * 0.60) / 1_000_000
-
-        usd_to_inr_rate = 87.0
-        cost_inr = cost_usd * usd_to_inr_rate
-
-        # Guarantee status, status_code, subject_name, subject_code, chapters, and learning_outcomes
+        # Guarantee status, subject_name, subject_code, chapters, and learning_outcomes
         parsed_result["status"] = "success"
-        parsed_result["status_code"] = 200
-        parsed_result["message"] = "Syllabus extracted and parsed successfully."
         if subject_name and not parsed_result.get("subject_name"):
             parsed_result["subject_name"] = subject_name
         if subject_code and not parsed_result.get("subject_code"):
@@ -1070,27 +1040,6 @@ REQUIRED FINAL JSON OUTPUT SCHEMA:
             parsed_result["learning_outcomes"] = []
         if "syllabus_content" not in parsed_result or not parsed_result["syllabus_content"]:
             parsed_result["syllabus_content"] = f"Curriculum overview for {subject_name or 'the subject'}."
-
-        # Attach metadata with token usage & cost in INR and USD
-        parsed_result["metadata"] = {
-            "total_pages": total_pages,
-            "pages_with_text": pages_with_text,
-            "total_characters": total_chars,
-            "chunks_processed": len(chunks),
-            "token_usage": {
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": total_tokens
-            },
-            "extraction_cost": {
-                "model": model,
-                "cost_usd": round(cost_usd, 6),
-                "cost_inr": round(cost_inr, 4),
-                "formatted_usd": f"${cost_usd:.6f}",
-                "formatted_inr": f"₹{cost_inr:.4f}",
-                "exchange_rate": "1 USD = 87.00 INR"
-            }
-        }
 
         return jsonify(parsed_result), 200
 
