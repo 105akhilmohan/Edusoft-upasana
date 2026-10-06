@@ -177,86 +177,134 @@ def normalize_subject(subject_name: str) -> str:
     return clean.replace(" ", "_")
 
 
-def normalize_chapter_key(chapter_name: str) -> str:
-    """Normalize chapter string to lookup key (e.g. '1: Arithmetic Operations' -> 'arithmetic_operations')."""
-    if not chapter_name:
-        return ""
-    clean = str(chapter_name).lower().strip()
-    clean = re.sub(r"^(chapter|ch)?\s*\d+\s*[:\-\.]\s*", "", clean)
-    clean = re.sub(r"[^\w\s]", "", clean)
-    clean = re.sub(r"\s+", "_", clean).strip("_")
-    return clean
+# Registry for extracted textbooks: (cls_key, subj_key) -> dict of chapters
+EXTRACTED_TEXTBOOK_REGISTRY = {}
 
 
-def synthesize_curriculum_content(class_name: str, subject_name: str, chapter_name: str) -> str:
+def register_extracted_textbook(subject_name: str, subject_code: str, chapters: list, class_name: str = ""):
     """
-    Dynamically constructs authoritative, grade-bound syllabus content for any requested chapter
-    to ensure the LLM is strictly grounded and never drifts into secondary science/physics.
+    Registers authentic textbook chapters extracted directly from a PDF.
+    Preserves 100% full chapter content and original textbook chapter names.
     """
+    if not chapters:
+        return
+
+    cls_key = normalize_class(class_name) if class_name else "all"
+    subj_key = normalize_subject(subject_name)
+    
+    registry_key = f"{cls_key}:{subj_key}"
+    if registry_key not in EXTRACTED_TEXTBOOK_REGISTRY:
+        EXTRACTED_TEXTBOOK_REGISTRY[registry_key] = {}
+
+    for ch in chapters:
+        ch_id = str(ch.get("chapter_id") or normalize_chapter_key(ch.get("chapter_name", "")))
+        ch_name = str(ch.get("chapter_name", "")).strip()
+        record = {
+            "chapter_id": ch_id,
+            "chapter_no": str(ch.get("chapter_no", "")),
+            "chapter_name": ch_name,
+            "chapter_name_source": ch.get("chapter_name_source", "textbook_pdf"),
+            "chapter_name_verified": ch.get("chapter_name_verified", True),
+            "source_pdf_page": ch.get("source_pdf_page") or ch.get("start_page"),
+            "start_page": ch.get("start_page"),
+            "end_page": ch.get("end_page"),
+            "description": ch.get("description", ""),
+            "content": ch.get("content", "")
+        }
+        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][ch_id] = record
+        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][normalize_chapter_key(ch_name)] = record
+        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][ch_name.lower()] = record
+
+    logger.info(f"Registered {len(chapters)} authentic chapters in textbook registry for {registry_key}")
+
+
+def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_identifier: str, payload_content: str = None) -> dict:
+    """
+    Retrieve authentic textbook chapter record using class, subject, and chapter_id/name.
+    Returns dictionary with keys: chapter_id, chapter_name, content, chapter_name_source, chapter_name_verified.
+    """
+    chap_id = str(chapter_identifier or "").strip()
+    logger.info("Looking up textbook: class=%r subject=%r chapter_id=%r", class_name, subject_name, chap_id)
+
+    # 1. Payload-supplied content
+    if payload_content and isinstance(payload_content, str) and len(payload_content.strip()) > 20:
+        record = {
+            "chapter_id": normalize_chapter_key(chap_id),
+            "chapter_name": chap_id or subject_name or "Textbook Chapter",
+            "content": payload_content.strip(),
+            "chapter_name_source": "payload_supplied",
+            "chapter_name_verified": True
+        }
+        logger.info("Resolved textbook chapter: chapter_name=%r", record["chapter_name"])
+        logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", record["chapter_id"], record["chapter_name"], len(record["content"]))
+        return record
+
     cls_key = normalize_class(class_name)
     subj_key = normalize_subject(subject_name)
-    raw_chap_clean = re.sub(r"^(chapter|ch)?\s*\d+\s*[:\-\.]\s*", "", chapter_name).strip()
+    chap_norm = normalize_chapter_key(chap_id)
+    chap_lower = chap_id.lower()
 
-    try:
-        cls_num = int(cls_key)
-    except ValueError:
-        cls_num = 1
+    # 2. Check EXTRACTED_TEXTBOOK_REGISTRY
+    search_keys = [f"{cls_key}:{subj_key}", f"all:{subj_key}"]
+    for reg_k in search_keys:
+        if reg_k in EXTRACTED_TEXTBOOK_REGISTRY:
+            reg_dict = EXTRACTED_TEXTBOOK_REGISTRY[reg_k]
+            if chap_id in reg_dict:
+                rec = reg_dict[chap_id]
+                logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
+                logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+                return rec
+            if chap_norm in reg_dict:
+                rec = reg_dict[chap_norm]
+                logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
+                logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+                return rec
+            if chap_lower in reg_dict:
+                rec = reg_dict[chap_lower]
+                logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
+                logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+                return rec
+            for k, rec in reg_dict.items():
+                if chap_norm in k or k in chap_norm:
+                    logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
+                    logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+                    return rec
 
-    if cls_num <= 5:
-        # Primary Grade Synthesis
-        return (
-            f"OFFICIAL PRIMARY SCHOOL CURRICULUM - CLASS {cls_key}\n"
-            f"SUBJECT: {subject_name}\n"
-            f"CHAPTER: {chapter_name}\n\n"
-            f"Scope & Boundary Rules:\n"
-            f"- Target Student Age: {cls_num + 5} years old (Primary School Grade {cls_num}).\n"
-            f"- Topic Focus: Fundamental concepts relating exclusively to '{raw_chap_clean}'.\n"
-            f"- Core Vocabulary: Simple elementary everyday words and practical examples suitable for Class {cls_num}.\n"
-            f"- Mandatory Scope: Only basic grade-appropriate facts, simple identification, counting/naming, and elementary concepts.\n"
-            f"- STRICTLY FORBIDDEN: Any secondary school physics, mechanics, optics, lenses, forces, velocity, momentum, formulas, chemistry, or advanced theories."
-        )
-    else:
-        # Secondary / Middle School Synthesis
-        return (
-            f"OFFICIAL SCHOOL CURRICULUM - CLASS {cls_key}\n"
-            f"SUBJECT: {subject_name}\n"
-            f"CHAPTER: {chapter_name}\n\n"
-            f"Scope & Boundary Rules:\n"
-            f"- Topic Focus: Standard school syllabus concepts relating strictly to '{raw_chap_clean}'.\n"
-            f"- All questions must strictly pertain to {subject_name} and '{raw_chap_clean}'.\n"
-            f"- Do NOT introduce concepts from other subjects."
-        )
+    # 3. Check local curated database
+    if cls_key in TEXTBOOK_DATABASE:
+        subj_dict = TEXTBOOK_DATABASE[cls_key].get(subj_key, {})
+        if chap_norm in subj_dict:
+            rec = {
+                "chapter_id": chap_norm,
+                "chapter_name": chap_id,
+                "content": subj_dict[chap_norm],
+                "chapter_name_source": "textbook_db",
+                "chapter_name_verified": True
+            }
+            logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
+            logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+            return rec
+
+    # 4. Fallback: synthesizes grade-bound curriculum bounds only if textbook PDF was not uploaded
+    synthetic_content = synthesize_curriculum_content(class_name, subject_name, chap_id)
+    rec = {
+        "chapter_id": chap_norm or "general_chapter",
+        "chapter_name": chap_id or subject_name,
+        "content": synthetic_content,
+        "chapter_name_source": "curriculum_synthesized",
+        "chapter_name_verified": False
+    }
+    logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
+    logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+    return rec
 
 
 def get_textbook_content(class_name: str, subject_name: str, chapter_name: str, payload_content: str = None) -> tuple:
     """
-    Retrieve exact textbook content using Class + Subject + Chapter.
-    Returns (content_text, content_identifier).
+    Backwards-compatible helper returning (content_text, content_identifier).
     """
-    # 1. Payload-supplied content
-    if payload_content and isinstance(payload_content, str) and len(payload_content.strip()) > 20:
-        logger.info(f"Using request-supplied textbook content (length={len(payload_content.strip())})")
-        return payload_content.strip(), f"payload_supplied_content:{subject_name}:{chapter_name}"
-
-    cls_key = normalize_class(class_name)
-    subj_key = normalize_subject(subject_name)
-    chap_key = normalize_chapter_key(chapter_name)
-
-    logger.info(f"Looking up textbook repo: Class='{cls_key}', Subject='{subj_key}', Chapter='{chap_key}'")
-
-    # 2. Check local curated database
-    if cls_key in TEXTBOOK_DATABASE:
-        subj_dict = TEXTBOOK_DATABASE[cls_key].get(subj_key, {})
-        if chap_key in subj_dict:
-            return subj_dict[chap_key], f"textbook_db:class_{cls_key}:{subj_key}:{chap_key}"
-        
-        for k, text in subj_dict.items():
-            if k in chap_key or chap_key in k or any(part in k for part in chap_key.split("_") if len(part) > 3):
-                return text, f"textbook_db:class_{cls_key}:{subj_key}:{k}"
-
-    # 3. Dynamic curriculum synthesizer (Grade & Scope Bound)
-    synthetic_content = synthesize_curriculum_content(class_name, subject_name, chapter_name)
-    return synthetic_content, f"curriculum_synthesized:class_{cls_key}:{subj_key}:{chap_key}"
+    rec = get_textbook_chapter_record(class_name, subject_name, chapter_name, payload_content)
+    return rec["content"], f"{rec['chapter_name_source']}:{rec['chapter_id']}"
 
 
 def normalize_text_for_comparison(text: str) -> str:

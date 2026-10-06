@@ -323,7 +323,9 @@ Return valid JSON only.
 
 
 from textbook_repo import (
+    get_textbook_chapter_record,
     get_textbook_content,
+    register_extracted_textbook,
     validate_question,
     normalize_text_for_comparison,
     normalize_class,
@@ -406,12 +408,15 @@ def generate_questions():
         # ----------------------------------------------------------------------
         # STEP 1: RETRIEVE TEXTBOOK CONTENT (Source of Truth)
         # ----------------------------------------------------------------------
-        textbook_content, content_id = get_textbook_content(
+        chapter_record = get_textbook_chapter_record(
             class_name=class_name,
             subject_name=subject_name,
-            chapter_name=primary_chapter,
+            chapter_identifier=primary_chapter,
             payload_content=payload_content
         )
+        textbook_content = chapter_record.get("content", "")
+        real_chapter_name = chapter_record.get("chapter_name", primary_chapter)
+        chapter_id = chapter_record.get("chapter_id", "")
 
         if not textbook_content:
             logger.warning(f"Textbook content not found for Class='{class_name}', Subject='{subject_name}', Chapter='{primary_chapter}'")
@@ -421,9 +426,12 @@ def generate_questions():
                 "message": "Textbook content not found for the selected class, subject, and chapter."
             }), 404
 
-        # Logging source content metadata as required
-        logger.info(f"Generating questions: Class = {class_name}, Subject = {subject_name}, Chapter = {primary_chapter}")
-        logger.info(f"Retrieved textbook content: {content_id}, Content length = {len(textbook_content)}")
+        logger.info(
+            "Generating questions: Class=%r Subject=%r Chapter=%r",
+            class_name,
+            subject_name,
+            real_chapter_name
+        )
 
         # ----------------------------------------------------------------------
         # STEP 2: BUILD PROMPTS WITH TEXTBOOK AS ONLY SOURCE OF TRUTH
@@ -440,7 +448,7 @@ MANDATORY RULES:
 2. Every question, model answer, and step marking MUST be directly and strictly derived from the provided textbook content below.
 3. Target Class Level: Class {class_name}.
 4. Target Subject: {subject_name}.
-5. Chapter: {primary_chapter}.
+5. Chapter: {real_chapter_name}.
 6. QUESTION FORMATS: Generate ONLY Descriptive (Short Answer, Long Answer, Analytical) and Application-level / Case-Based questions. Do NOT generate Multiple Choice Questions (MCQs).
 7. Application-level questions must require practical problem-solving, clinical/functional correlations, or scenario analysis based strictly on the textbook content.
 8. Include thorough, step-by-step marking schemes and complete model answers.
@@ -461,7 +469,7 @@ SPECIFICATIONS
 ============================================================
 Target Class: {class_name}
 Target Subject: {subject_name}
-Target Chapter: {primary_chapter}
+Target Chapter: {real_chapter_name}
 Difficulty: {difficulty}
 Requested Types: {', '.join(question_types)}
 {f"Suggestions: {suggestions}" if suggestions else ""}
@@ -480,13 +488,13 @@ Return a valid JSON object matching this schema:
 {{
   "class_name": "{class_name}",
   "subject_name": "{subject_name}",
-  "chapters": {json.dumps(chapters)},
+  "chapters": {json.dumps([real_chapter_name] if chapters else [real_chapter_name])},
   "total_questions": {question_count},
   "difficulty": "{difficulty}",
   "questions": [
     {{
       "id": 1,
-      "chapter": "{primary_chapter}",
+      "chapter": "{real_chapter_name}",
       "type": "Descriptive | Short Answer | Long Answer | Application | Case-Based | Numerical",
       "marks": 5,
       "question": "Detailed descriptive or application-level question text here",
@@ -546,7 +554,7 @@ Return a valid JSON object matching this schema:
                 q_obj=q_obj,
                 class_name=class_name,
                 subject_name=subject_name,
-                chapter_name=primary_chapter,
+                chapter_name=real_chapter_name,
                 textbook_content=textbook_content
             )
 
@@ -555,9 +563,9 @@ Return a valid JSON object matching this schema:
                 # Enforce clean fields
                 clean_q = dict(q_obj)
                 clean_q["id"] = len(valid_questions) + 1
-                clean_q["chapter"] = primary_chapter  # Hard constraint: exact requested chapter name
-                clean_q.pop("explanation", None)       # Enforce: no explanation
-                clean_q.pop("options", None)           # Remove options since no MCQs
+                clean_q["chapter"] = real_chapter_name  # Exact authentic chapter name from textbook
+                clean_q.pop("explanation", None)        # Enforce: no explanation
+                clean_q.pop("options", None)            # Remove options since no MCQs
                 valid_questions.append(clean_q)
                 seen_normalized_texts.add(norm_text)
             else:
@@ -583,7 +591,7 @@ Exclude already generated questions:
 Specifications:
 Class: {class_name}
 Subject: {subject_name}
-Chapter: {primary_chapter}
+Chapter: {real_chapter_name}
 Difficulty: {difficulty}
 Types: {', '.join(question_types)}
 
@@ -615,13 +623,13 @@ Return JSON with "questions" array. Do NOT include explanations.
                     q_obj=q_obj,
                     class_name=class_name,
                     subject_name=subject_name,
-                    chapter_name=primary_chapter,
+                    chapter_name=real_chapter_name,
                     textbook_content=textbook_content
                 )
                 if is_valid:
                     clean_q = dict(q_obj)
                     clean_q["id"] = len(valid_questions) + 1
-                    clean_q["chapter"] = primary_chapter
+                    clean_q["chapter"] = real_chapter_name
                     clean_q.pop("explanation", None)
                     valid_questions.append(clean_q)
                     seen_normalized_texts.add(norm_text)
@@ -633,7 +641,7 @@ Return JSON with "questions" array. Do NOT include explanations.
         response_payload = {
             "class_name": class_name,
             "subject_name": subject_name,
-            "chapters": chapters,
+            "chapters": [real_chapter_name] if chapters else [real_chapter_name],
             "total_questions": len(valid_questions),
             "difficulty": difficulty,
             "questions": valid_questions
@@ -1102,6 +1110,7 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
         c_name_norm = re.sub(r"[^\w\s]", "", c_name.upper()).strip()
 
         matched_page = None
+        is_verified = False
 
         # Strategy A: Targeted search around expected PDF page using dynamic offset
         if c_printed and isinstance(c_printed, int):
@@ -1112,6 +1121,7 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
                     line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
                     if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
                         matched_page = p["page_number"]
+                        is_verified = True
                         break
                 if matched_page is not None:
                     break
@@ -1123,9 +1133,11 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
                     line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
                     if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
                         matched_page = p["page_number"]
+                        is_verified = True
                         break
                     elif c_name_norm in line_clean and len(line_clean) <= len(c_name_norm) + 12:
                         matched_page = p["page_number"]
+                        is_verified = True
                         break
                 if matched_page is not None:
                     break
@@ -1144,7 +1156,8 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
         positioned_chapters.append({
             "chapter_no": c_no or str(len(positioned_chapters) + 1),
             "chapter_name": c_name,
-            "start_page": matched_page
+            "start_page": matched_page,
+            "verified": is_verified
         })
 
     positioned_chapters.sort(key=lambda x: x["start_page"])
@@ -1161,7 +1174,11 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
         else:
             end_p = all_page_numbers[-1]
 
-        logger.info("[CHAPTER] #%s | %s | PDF pages %s-%s", ch["chapter_no"], ch["chapter_name"], start_p, end_p)
+        logger.info("[TEXTBOOK CHAPTER] #%s name=%r start=%s end=%s", ch["chapter_no"], ch["chapter_name"], start_p, end_p)
+        if ch.get("verified"):
+            logger.info("[CHAPTER VERIFIED] name=%r source=%s", ch["chapter_name"], "textbook_pdf")
+        else:
+            logger.warning("[CHAPTER VERIFICATION FAILED] name=%r", ch["chapter_name"])
 
         chapter_pages_text = []
         for p in cleaned_pages:
@@ -1177,8 +1194,8 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
                     break
 
         logger.info(
-            "[CHAPTER CONTENT] #%s %s | pages=%s-%s | characters=%s",
-            ch["chapter_no"], ch["chapter_name"], start_p, end_p, len(full_content)
+            "[CHAPTER CONTENT] name=%r characters=%s",
+            ch["chapter_name"], len(full_content)
         )
 
         sample_snippet = full_content[:3000] if full_content else ch["chapter_name"]
@@ -1190,17 +1207,23 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
         else:
             description = f"Comprehensive curriculum and textbook coverage of {ch['chapter_name']}."
 
+        ch_id = re.sub(r"[^\w\s]", "", ch["chapter_name"].lower()).strip().replace(" ", "_")
+        ch_id = re.sub(r"_+", "_", ch_id)
+
         final_chapters.append({
+            "chapter_id": ch_id,
             "chapter_no": ch["chapter_no"],
             "chapter_name": ch["chapter_name"],
+            "chapter_name_source": "textbook_pdf",
+            "chapter_name_verified": ch.get("verified", True),
+            "source_pdf_page": start_p,
             "start_page": start_p,
             "end_page": end_p,
             "description": description,
             "content": full_content
         })
 
-    logger.info("[COMPLETE] PDF extraction finished | pages=%s | chapters=%s", len(cleaned_pages), len(final_chapters))
-    logger.info("========== PDF EXTRACTION END ==========")
+    logger.info("[EXTRACTION COMPLETE] pages=%s chapters=%s", len(cleaned_pages), len(final_chapters))
     return final_chapters, total_assigned_pages
 
 
@@ -1266,8 +1289,7 @@ def extract_syllabus():
         else:
             model = DEFAULT_MODEL or "gpt-4o-mini"
 
-        logger.info("========== PDF EXTRACTION START ==========")
-        logger.info("PDF: %s", temp_pdf_path or "Direct Text Input")
+        logger.info("========== TEXTBOOK EXTRACTION START ==========")
 
         # Step 1: Extract all pages with bounding-box coordinate reading order
         if temp_pdf_path and os.path.exists(temp_pdf_path):
@@ -1275,7 +1297,7 @@ def extract_syllabus():
                 import pdfplumber
                 with pdfplumber.open(temp_pdf_path) as pdf:
                     total_pages = len(pdf.pages)
-                    logger.info("Total PDF pages: %s", total_pages)
+                    logger.info("[PDF] Total pages=%s", total_pages)
 
                     for page_num, page in enumerate(pdf.pages, start=1):
                         lines, col_count, suspicious = extract_page_lines_reading_order(
@@ -1303,20 +1325,16 @@ def extract_syllabus():
                             pages_with_text += 1
 
                         logger.info(
-                            "[EXTRACT] Page %s/%s | words=%s | lines=%s | columns=%s",
+                            "[PDF PAGE] %s/%s extracted",
                             page_num,
-                            total_pages,
-                            sum(len(l.split()) for l in lines),
-                            len(lines),
-                            col_count
+                            total_pages
                         )
 
                         if page_num % 10 == 0 or page_num == total_pages:
                             logger.info(
-                                "[PROGRESS] Extracted %s/%s pages (%.1f%%)",
+                                "[PROGRESS] %s/%s pages",
                                 page_num,
-                                total_pages,
-                                page_num / total_pages * 100
+                                total_pages
                             )
 
                         if page_num % 25 == 0:
@@ -1395,6 +1413,13 @@ def extract_syllabus():
             cleaned_pages=cleaned_pages,
             chapter_map=chapter_map,
             subject_name=subject_name
+        )
+
+        # Register authentic chapters in textbook registry for subsequent question generation
+        register_extracted_textbook(
+            subject_name=subject_name,
+            subject_code=subject_code,
+            chapters=final_chapters
         )
 
         avg_columns = (sum(detected_column_counts) / len(detected_column_counts)) if detected_column_counts else 1
