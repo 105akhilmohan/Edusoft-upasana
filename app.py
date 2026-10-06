@@ -379,15 +379,18 @@ def generate_questions():
                     "message": "Field 'question_count' must be a valid integer."
                 }), 400
 
-        # Difficulty & Question Types
+        # Difficulty & Question Types (Descriptive & Application-level, No MCQs)
         difficulty = data.get("difficulty", "Medium")
-        q_types_raw = data.get("question_types") or data.get("question_type") or ["MCQ", "Short", "Long"]
+        q_types_raw = data.get("question_types") or data.get("question_type") or ["Descriptive", "Short Answer", "Long Answer", "Application", "Case-Based"]
         if isinstance(q_types_raw, list):
-            question_types = [str(t).strip() for t in q_types_raw if str(t).strip()]
+            question_types = [str(t).strip() for t in q_types_raw if str(t).strip() and str(t).strip().upper() != "MCQ"]
         elif isinstance(q_types_raw, str) and q_types_raw.strip():
-            question_types = [q_types_raw.strip()]
+            question_types = [t.strip() for t in q_types_raw.split(",") if t.strip() and t.strip().upper() != "MCQ"]
         else:
-            question_types = ["MCQ", "Short", "Long"]
+            question_types = ["Descriptive", "Short Answer", "Long Answer", "Application", "Case-Based"]
+
+        if not question_types:
+            question_types = ["Descriptive", "Short Answer", "Long Answer", "Application", "Case-Based"]
 
         suggestions = data.get("suggestions") or data.get("description", "")
         payload_content = data.get("textbook_content") or data.get("content") or data.get("chapter_content")
@@ -407,6 +410,7 @@ def generate_questions():
             logger.warning(f"Textbook content not found for Class='{class_name}', Subject='{subject_name}', Chapter='{primary_chapter}'")
             return jsonify({
                 "status": "error",
+                "status_code": 404,
                 "message": "Textbook content not found for the selected class, subject, and chapter."
             }), 404
 
@@ -422,18 +426,19 @@ def generate_questions():
         generation_nonce = f"{uuid.uuid4().hex[:8]}-{int(time.time() * 1000)}"
 
         system_prompt = f"""
-You are an expert school curriculum designer and examination question generator for Edusoft.
+You are an expert curriculum designer and examination question generator for Edusoft.
 
 MANDATORY RULES:
 1. The supplied textbook content is the ONLY source of truth.
-2. Every question, option, correct answer, and step marking MUST be directly and strictly derived from the provided textbook content below.
+2. Every question, model answer, and step marking MUST be directly and strictly derived from the provided textbook content below.
 3. Target Class Level: Class {class_name}.
 4. Target Subject: {subject_name}.
 5. Chapter: {primary_chapter}.
-6. Do NOT use outside knowledge or introduce any concepts from other subjects (e.g. absolutely no Physics/Science when generating Maths questions).
-7. For Class 1: Only simple single-digit numbers (1-20), counting, basic addition/subtraction, and shapes. NEVER use high-school physics or mechanics.
-8. Do NOT include any 'explanation' field.
-9. Return strictly valid JSON only.
+6. QUESTION FORMATS: Generate ONLY Descriptive (Short Answer, Long Answer, Analytical) and Application-level / Case-Based questions. Do NOT generate Multiple Choice Questions (MCQs).
+7. Application-level questions must require practical problem-solving, clinical/functional correlations, or scenario analysis based strictly on the textbook content.
+8. Include thorough, step-by-step marking schemes and complete model answers.
+9. Do NOT include any 'explanation' field.
+10. Return strictly valid JSON only.
 """
 
         user_prompt = f"""
@@ -459,10 +464,9 @@ Random Variation Seed: {generation_nonce}
 STRICT GENERATION RULES
 ============================================================
 - Generate exactly {question_count} questions answerable directly from the textbook content above.
-- Every question MUST be pure {subject_name} suitable for Class {class_name}.
-- For MCQs: 4 plausible options within the textbook scope.
-- For Numerical: Simple age-appropriate calculations.
-- For Short/Long: Model answer and step-by-step marking.
+- Focus on Descriptive questions (Short Answer, Long Answer, Conceptual Breakdowns) and Application-Level questions (Clinical/Practical Scenarios, Problem-Solving).
+- Absolutely NO Multiple Choice Questions (MCQs).
+- Provide detailed model answers (`correct_answer`) and granular step-by-step marking schemes (`step_marking`).
 - Do NOT include any 'explanation' field.
 
 Return a valid JSON object matching this schema:
@@ -476,15 +480,18 @@ Return a valid JSON object matching this schema:
     {{
       "id": 1,
       "chapter": "{primary_chapter}",
-      "type": "MCQ | Short | Long | Numerical",
-      "marks": 2,
-      "question": "Question text here",
-      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
-      "correct_answer": "Correct answer or model answer",
+      "type": "Descriptive | Short Answer | Long Answer | Application | Case-Based | Numerical",
+      "marks": 5,
+      "question": "Detailed descriptive or application-level question text here",
+      "correct_answer": "Complete, comprehensive model answer based strictly on textbook content",
       "step_marking": [
         {{
-          "step": "Step description",
-          "marks": 1
+          "step": "Specific concept, step, or key point",
+          "marks": 2
+        }},
+        {{
+          "step": "Detailed clinical/practical explanation or conclusion",
+          "marks": 3
         }}
       ],
       "difficulty": "Easy | Medium | Hard"
@@ -543,6 +550,7 @@ Return a valid JSON object matching this schema:
                 clean_q["id"] = len(valid_questions) + 1
                 clean_q["chapter"] = primary_chapter  # Hard constraint: exact requested chapter name
                 clean_q.pop("explanation", None)       # Enforce: no explanation
+                clean_q.pop("options", None)           # Remove options since no MCQs
                 valid_questions.append(clean_q)
                 seen_normalized_texts.add(norm_text)
             else:
@@ -649,72 +657,331 @@ Return JSON with "questions" array. Do NOT include explanations.
 
 
 # ==============================================================================
-# 3. SYLLABUS PDF EXTRACTION & PARSING ENDPOINT (pdfplumber + OpenAI)
-def chunk_pdf_pages(page_records, max_chunk_chars=40000):
+# 3. FULL TEXTBOOK & SYLLABUS PDF EXTRACTION PIPELINE (pdfplumber + TOC + Chapters)
+# ==============================================================================
+
+def clean_page_headers_and_footers(page_records):
     """
-    Split extracted PDF pages into safe chunks adhering strictly to page boundaries.
-    Never split in the middle of a page unless an individual page exceeds max_chunk_chars.
+    Conservatively detect and remove repeated running headers, footers,
+    standalone page numbers, and digitization stamps across pages,
+    while strictly preserving legitimate chapter titles, subsection headings,
+    figure captions, and body text.
     """
-    chunks = []
-    current_chunk_pages = []
-    current_chunk_len = 0
+    if not page_records:
+        return []
 
-    for page_num, text in page_records:
-        formatted_page = f"--- PAGE {page_num} ---\n{text}\n\n"
-        page_len = len(formatted_page)
+    top_line_freq = {}
+    bottom_line_freq = {}
+    total_pages = len(page_records)
 
-        # If single page exceeds max_chunk_chars, split that single page
-        if page_len > max_chunk_chars:
-            # Flush accumulated pages first
-            if current_chunk_pages:
-                chunks.append("".join(current_chunk_pages).strip())
-                current_chunk_pages = []
-                current_chunk_len = 0
+    for rec in page_records:
+        lines = rec.get("lines", [])
+        if lines:
+            top_line = lines[0].strip().upper()
+            top_line_freq[top_line] = top_line_freq.get(top_line, 0) + 1
+        if len(lines) > 1:
+            bottom_line = lines[-1].strip().upper()
+            bottom_line_freq[bottom_line] = bottom_line_freq.get(bottom_line, 0) + 1
 
-            # Slice large page
-            start_idx = 0
-            part_num = 1
-            while start_idx < len(text):
-                sub_text = text[start_idx:start_idx + (max_chunk_chars - 200)]
-                chunks.append(f"--- PAGE {page_num} (Part {part_num}) ---\n{sub_text}".strip())
-                start_idx += (max_chunk_chars - 200)
-                part_num += 1
+    # Detect repeated headers/footers appearing on multiple pages
+    threshold = max(3, int(total_pages * 0.04)) if total_pages >= 15 else 2
+    repeated_top_headers = {k for k, v in top_line_freq.items() if v >= threshold and len(k) > 2}
+    repeated_bottom_footers = {k for k, v in bottom_line_freq.items() if v >= threshold and len(k) > 2}
+
+    cleaned_records = []
+    for rec in page_records:
+        lines = list(rec.get("lines", []))
+        p_num = rec["page_number"]
+        if not lines:
             continue
 
-        # Check if adding this page exceeds chunk size
-        if current_chunk_len + page_len > max_chunk_chars and current_chunk_pages:
-            chunks.append("".join(current_chunk_pages).strip())
-            current_chunk_pages = [formatted_page]
-            current_chunk_len = page_len
+        # Check top line 1
+        if lines:
+            top = lines[0].strip()
+            top_upper = top.upper()
+            if re.match(r"^\d{1,4}$", top):
+                lines.pop(0)
+            elif top_upper in repeated_top_headers:
+                lines.pop(0)
+            elif any(stamp in top_upper for stamp in ["INTERNET ARCHIVE", "DIGITIZED BY", "MICROSOFT CORP", "GOOGLE BOOK", "LIBRARY OF", "UNIVERSITY OF"]):
+                lines.pop(0)
+
+        # Check top line 2
+        if lines:
+            top = lines[0].strip()
+            top_upper = top.upper()
+            if re.match(r"^\d{1,4}$", top):
+                lines.pop(0)
+            elif top_upper in repeated_top_headers:
+                lines.pop(0)
+
+        # Check bottom line 1
+        if lines:
+            bot = lines[-1].strip()
+            bot_upper = bot.upper()
+            if re.match(r"^\d{1,4}$", bot):
+                lines.pop()
+            elif bot_upper in repeated_bottom_footers:
+                lines.pop()
+            elif any(stamp in bot_upper for stamp in ["INTERNET ARCHIVE", "DIGITIZED BY", "MICROSOFT CORP", "GOOGLE BOOK", "LIBRARY OF"]):
+                lines.pop()
+
+        # Check bottom line 2
+        if lines:
+            bot = lines[-1].strip()
+            bot_upper = bot.upper()
+            if re.match(r"^\d{1,4}$", bot):
+                lines.pop()
+            elif bot_upper in repeated_bottom_footers:
+                lines.pop()
+
+        cleaned_text = "\n".join(lines).strip()
+        if cleaned_text:
+            cleaned_records.append({
+                "page_number": p_num,
+                "text": cleaned_text,
+                "lines": lines
+            })
+
+    return cleaned_records
+
+
+def detect_table_of_contents_and_chapters(cleaned_pages, client, model, subject_name="", subject_code=""):
+    """
+    Scans the opening pages (first 35 pages) for Table of Contents,
+    and extracts authentic chapter names directly from the book.
+    Returns list of dicts: [{"chapter_no": "1", "chapter_name": "...", "printed_page": 16}, ...]
+    """
+    toc_text_pages = []
+    toc_detected = False
+
+    # 1. Search first 35 pages for TOC headers
+    for p in cleaned_pages[:35]:
+        txt_upper = p["text"].upper()
+        if any(h in txt_upper for h in ["CONTENTS", "TABLE OF CONTENTS", "INDEX OF CHAPTERS", "LIST OF CHAPTERS"]):
+            toc_detected = True
+            toc_text_pages.append(f"--- PAGE {p['page_number']} ---\n{p['text']}")
+        elif toc_detected and len(toc_text_pages) < 8:
+            if re.search(r"(\.{3,}|\b(?:chapter|unit|section|part)\b|\b\d{1,3}\b)", p["text"], re.I):
+                toc_text_pages.append(f"--- PAGE {p['page_number']} ---\n{p['text']}")
+            else:
+                break
+
+    toc_combined = "\n\n".join(toc_text_pages)
+
+    if toc_combined and len(toc_combined) > 50:
+        logger.info(f"Detected Table of Contents across {len(toc_text_pages)} pages. Extracting authentic chapter list...")
+        toc_prompt = f"""
+You are an expert curriculum structure and textbook analyzer.
+Extract the exact major chapters/units and their printed start pages from the provided Table of Contents text below.
+
+MANDATORY RULES:
+1. ONLY extract chapters/sections actually listed in this Table of Contents.
+2. Do NOT invent chapter names. Do NOT use outside knowledge.
+3. Preserve the exact chapter order and names from the textbook.
+4. Extract 'chapter_no', 'chapter_name', and 'printed_page' (integer if visible, else null).
+
+============================================================
+TABLE OF CONTENTS TEXT:
+============================================================
+{toc_combined}
+
+Return valid JSON strictly matching:
+{{
+  "chapters": [
+    {{
+      "chapter_no": "1",
+      "chapter_name": "THE SCALP",
+      "printed_page": 16
+    }}
+  ]
+}}
+"""
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You extract exact chapter titles from Table of Contents text. Return valid JSON only."},
+                    {"role": "user", "content": toc_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            parsed = json.loads(resp.choices[0].message.content)
+            extracted = parsed.get("chapters", [])
+            if isinstance(extracted, list) and len(extracted) > 0:
+                clean_extracted = []
+                for idx, c in enumerate(extracted, start=1):
+                    c_name = str(c.get("chapter_name", "")).strip()
+                    if c_name and len(c_name) > 2:
+                        clean_extracted.append({
+                            "chapter_no": str(c.get("chapter_no") or idx),
+                            "chapter_name": c_name,
+                            "printed_page": c.get("printed_page")
+                        })
+                if clean_extracted:
+                    logger.info(f"Successfully extracted {len(clean_extracted)} chapters from TOC.")
+                    return clean_extracted
+        except Exception as toc_err:
+            logger.warning(f"Error parsing TOC with LLM: {toc_err}")
+
+    # Fallback: Structural regex scan across all pages for major chapter headings
+    logger.info("Scanning document pages for major chapter/unit headings via structural patterns...")
+    discovered_chapters = []
+    seen_names = set()
+
+    for p in cleaned_pages:
+        p_num = p["page_number"]
+        for line in p["lines"][:8]:
+            line_str = line.strip()
+            m = re.match(r"^(?:CHAPTER|UNIT|SECTION|PART)\s+([0-9IVXLCDM]+)[\s:\.\-—]+([^\n\r]+)", line_str, re.IGNORECASE)
+            if m:
+                ch_num = m.group(1).strip()
+                ch_name = m.group(2).strip()
+                norm_n = ch_name.upper()
+                if norm_n not in seen_names and len(ch_name) > 2:
+                    seen_names.add(norm_n)
+                    discovered_chapters.append({
+                        "chapter_no": str(ch_num),
+                        "chapter_name": ch_name,
+                        "start_page": p_num
+                    })
+            elif re.match(r"^[A-Z\s]{4,45}$", line_str) and len(line_str) > 3:
+                if line_str not in seen_names and line_str not in ["PREFACE", "INDEX", "APPENDIX", "CONTENTS", "TABLE OF CONTENTS"]:
+                    if len(line_str.split()) >= 1 and len(line_str) >= 5:
+                        seen_names.add(line_str)
+                        discovered_chapters.append({
+                            "chapter_no": str(len(discovered_chapters) + 1),
+                            "chapter_name": line_str,
+                            "start_page": p_num
+                        })
+
+    if discovered_chapters:
+        logger.info(f"Discovered {len(discovered_chapters)} chapters from heading scan.")
+        return discovered_chapters
+
+    # Ultimate fallback: single chapter containing the entire document
+    return [{
+        "chapter_no": "1",
+        "chapter_name": subject_name or "Full Curriculum / Textbook",
+        "start_page": cleaned_pages[0]["page_number"] if cleaned_pages else 1
+    }]
+
+
+def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name=""):
+    """
+    Locates exact start_page and end_page for every chapter,
+    and extracts the FULL readable textbook text belonging to each chapter.
+    """
+    if not cleaned_pages:
+        return []
+
+    page_num_to_index = {p["page_number"]: idx for idx, p in enumerate(cleaned_pages)}
+    all_page_numbers = [p["page_number"] for p in cleaned_pages]
+
+    positioned_chapters = []
+    for c in chapter_map:
+        c_name = c["chapter_name"].strip()
+        c_no = str(c.get("chapter_no", ""))
+        c_printed = c.get("printed_page")
+        c_name_upper = c_name.upper()
+
+        matched_page = None
+
+        # Strategy 1: Look around printed_page if given
+        if c_printed and isinstance(c_printed, int):
+            for p in cleaned_pages:
+                if abs(p["page_number"] - c_printed) <= 35:
+                    if c_name_upper in p["text"].upper():
+                        matched_page = p["page_number"]
+                        break
+
+        # Strategy 2: Search from beginning to end
+        if matched_page is None:
+            for p in cleaned_pages:
+                p_text_upper = p["text"].upper()
+                if c_name_upper in p_text_upper:
+                    if any(c_name_upper in l.upper() for l in p["lines"][:10]):
+                        matched_page = p["page_number"]
+                        break
+                    elif matched_page is None:
+                        matched_page = p["page_number"]
+
+        # Strategy 3: Fallback to existing start_page or printed_page
+        if matched_page is None:
+            matched_page = c.get("start_page") or (c_printed if c_printed and c_printed in page_num_to_index else None)
+
+        if matched_page is None:
+            matched_page = all_page_numbers[0]
+
+        positioned_chapters.append({
+            "chapter_no": c_no or str(len(positioned_chapters) + 1),
+            "chapter_name": c_name,
+            "start_page": matched_page
+        })
+
+    # Sort chapters by start_page
+    positioned_chapters.sort(key=lambda x: x["start_page"])
+
+    # Resolve end_page and assemble FULL content for each chapter
+    final_chapters = []
+    for i, ch in enumerate(positioned_chapters):
+        start_p = ch["start_page"]
+        if i + 1 < len(positioned_chapters):
+            next_start_p = positioned_chapters[i + 1]["start_page"]
+            end_p = max(start_p, next_start_p - 1)
         else:
-            current_chunk_pages.append(formatted_page)
-            current_chunk_len += page_len
+            end_p = all_page_numbers[-1]
 
-    if current_chunk_pages:
-        chunks.append("".join(current_chunk_pages).strip())
+        # Gather ALL pages between start_p and end_p
+        chapter_pages_text = []
+        for p in cleaned_pages:
+            if start_p <= p["page_number"] <= end_p:
+                chapter_pages_text.append(f"--- PAGE {p['page_number']} ---\n{p['text']}")
 
-    return chunks
+        full_content = "\n\n".join(chapter_pages_text).strip()
+        if not full_content and cleaned_pages:
+            for p in cleaned_pages:
+                if p["page_number"] == start_p:
+                    full_content = f"--- PAGE {p['page_number']} ---\n{p['text']}"
+                    break
+
+        sample_snippet = full_content[:3000] if full_content else ch["chapter_name"]
+        desc_lines = [l.strip() for l in sample_snippet.splitlines() if len(l.strip()) > 30 and not l.strip().startswith("---")]
+        if desc_lines:
+            description = " ".join(desc_lines[:3])[:300].strip()
+            if not description.endswith("."):
+                description += "."
+        else:
+            description = f"Comprehensive curriculum and textbook coverage of {ch['chapter_name']}."
+
+        final_chapters.append({
+            "chapter_no": ch["chapter_no"],
+            "chapter_name": ch["chapter_name"],
+            "start_page": start_p,
+            "end_page": end_p,
+            "description": description,
+            "content": full_content  # COMPLETE READABLE TEXTBOOK CONTENT PRESERVED!
+        })
+
+    return final_chapters
 
 
-# ==============================================================================
-# 3. SYLLABUS PDF EXTRACTION & PARSING ENDPOINT (pdfplumber + OpenAI Chunked)
-# ==============================================================================
 @app.route("/api/extract-syllabus", methods=["POST"])
 @app.route("/extract-syllabus", methods=["POST"])
 @app.route("/api/parse-syllabus-pdf", methods=["POST"])
 def extract_syllabus():
     """
-    Extract text from uploaded PDF using pdfplumber and generate structured
-    syllabus overview, chapter list with descriptions, and learning outcomes.
-    Supports both normal syllabus PDFs and large books (e.g. 600+ pages) via
-    page-boundary chunking, TOC-aware extraction, and sequential aggregation.
+    Extract text from uploaded full textbook or syllabus PDF using pdfplumber,
+    clean headers/footers, detect chapters via Table of Contents, map exact
+    chapter boundaries, and preserve 100% full chapter content without limits.
     """
     try:
         subject_name = ""
         subject_code = ""
         pdf_stream = None
         extracted_text = ""
-        page_records = []
+        raw_page_records = []
         total_pages = 0
         pages_with_text = 0
 
@@ -744,6 +1011,7 @@ def extract_syllabus():
                 except Exception as b64_err:
                     return jsonify({
                         "status": "error",
+                        "status_code": 400,
                         "message": f"Failed to decode base64 PDF: {str(b64_err)}"
                     }), 400
             elif "pdf_text" in data or "text" in data or "content" in data:
@@ -751,7 +1019,7 @@ def extract_syllabus():
         else:
             model = DEFAULT_MODEL or "gpt-4o-mini"
 
-        # Extract text page-by-page preserving boundaries with pdfplumber
+        # Step 1: Extract all pages page-by-page preserving boundaries with pdfplumber
         if pdf_stream:
             try:
                 import pdfplumber
@@ -765,41 +1033,63 @@ def extract_syllabus():
                             txt = ""
 
                         if txt and txt.strip():
-                            page_records.append((page_num, txt.strip()))
+                            clean_t = txt.strip()
+                            lines = [l.strip() for l in clean_t.splitlines() if l.strip()]
+                            raw_page_records.append({
+                                "page_number": page_num,
+                                "raw_text": clean_t,
+                                "lines": lines
+                            })
                             pages_with_text += 1
 
             except Exception as pdf_err:
                 logger.error(f"Error parsing PDF with pdfplumber: {str(pdf_err)}", exc_info=True)
                 return jsonify({
                     "status": "error",
+                    "status_code": 400,
                     "message": f"Error parsing PDF file: {str(pdf_err)}"
                 }), 400
 
         elif extracted_text:
-            # Reconstruct page records if simulated markers exist or treat as single block
             raw_lines = extracted_text.splitlines()
             current_page_num = 1
             current_page_lines = []
             for line in raw_lines:
                 if line.strip().startswith("--- PAGE ") or line.strip().startswith("PAGE "):
                     if current_page_lines:
-                        page_records.append((current_page_num, "\n".join(current_page_lines).strip()))
+                        clean_t = "\n".join(current_page_lines).strip()
+                        raw_page_records.append({
+                            "page_number": current_page_num,
+                            "raw_text": clean_t,
+                            "lines": [l.strip() for l in clean_t.splitlines() if l.strip()]
+                        })
                         current_page_lines = []
                         current_page_num += 1
                 current_page_lines.append(line)
             if current_page_lines:
-                page_records.append((current_page_num, "\n".join(current_page_lines).strip()))
+                clean_t = "\n".join(current_page_lines).strip()
+                raw_page_records.append({
+                    "page_number": current_page_num,
+                    "raw_text": clean_t,
+                    "lines": [l.strip() for l in clean_t.splitlines() if l.strip()]
+                })
 
-            if not page_records and extracted_text.strip():
-                page_records.append((1, extracted_text.strip()))
+            if not raw_page_records and extracted_text.strip():
+                clean_t = extracted_text.strip()
+                raw_page_records.append({
+                    "page_number": 1,
+                    "raw_text": clean_t,
+                    "lines": [l.strip() for l in clean_t.splitlines() if l.strip()]
+                })
 
-            total_pages = len(page_records)
-            pages_with_text = len([p for p in page_records if p[1]])
+            total_pages = len(raw_page_records)
+            pages_with_text = len(raw_page_records)
 
-        # Handle scanned/image-only PDFs gracefully
-        if not page_records or pages_with_text == 0:
+        # Graceful handling of scanned/image-only PDFs
+        if not raw_page_records or pages_with_text == 0:
             return jsonify({
                 "status": "error",
+                "status_code": 400,
                 "message": (
                     f"No readable text could be extracted from the provided PDF ({total_pages} total pages checked). "
                     "The document appears to contain scanned or image-only pages without an embedded text layer. "
@@ -809,239 +1099,95 @@ def extract_syllabus():
                 "pages_with_text": 0
             }), 400
 
-        total_chars = sum(len(text) for _, text in page_records)
-        logger.info(
-            f"PDF Extracted: {pages_with_text}/{total_pages} pages have text ({total_chars} total characters) "
-            f"for Subject: '{subject_name}' ({subject_code})"
+        logger.info(f"Extracted {pages_with_text}/{total_pages} pages with text for Subject: '{subject_name}' ({subject_code})")
+
+        # Step 2: Clean repeated running headers & footers conservatively
+        cleaned_pages = clean_page_headers_and_footers(raw_page_records)
+        logger.info(f"Cleaned page headers/footers across {len(cleaned_pages)} pages.")
+
+        # Step 3: Detect Table of Contents & authentic chapter list
+        chapter_map = detect_table_of_contents_and_chapters(
+            cleaned_pages=cleaned_pages,
+            client=client,
+            model=model,
+            subject_name=subject_name,
+            subject_code=subject_code
         )
 
-        # Chunk pages safely at page boundaries
-        chunks = chunk_pdf_pages(page_records, max_chunk_chars=40000)
-        logger.info(f"Formed {len(chunks)} chunk(s) for extraction.")
+        # Step 4: Map chapter boundaries & assemble complete full-textbook content per chapter
+        final_chapters = build_full_chapters_with_boundaries(
+            cleaned_pages=cleaned_pages,
+            chapter_map=chapter_map,
+            subject_name=subject_name
+        )
+        logger.info(f"Assembled {len(final_chapters)} complete chapters with full text content.")
 
-        # ======================================================================
-        # PATH A: SINGLE CHUNK (Small/Medium PDF)
-        # ======================================================================
-        if len(chunks) == 1:
-            full_text = chunks[0]
-            system_prompt = (
-                "You are an expert curriculum and syllabus extraction specialist. "
-                "Your objective is to analyze the provided extracted PDF document text for the specified subject and subject code, "
-                "and extract a clean, complete, structured syllabus curriculum.\n"
-                "MANDATORY RULES:\n"
-                "1. The provided PDF text is the ONLY source of truth. Do NOT invent chapters, units, or outside topics.\n"
-                "2. If a Table of Contents (TOC) or syllabus outline is present, use it to accurately identify syllabus chapters and units.\n"
-                "3. Do NOT assume every heading or section is a syllabus chapter. Extract only legitimate curriculum units/chapters.\n"
-                "4. 'syllabus_content': A concise 2-3 sentence executive overview of the subject curriculum and its core scope.\n"
-                "5. 'chapters': An ordered list of all chapters/units with 'chapter_no', 'chapter_name', and a comprehensive 'description' of topics covered.\n"
-                "6. 'learning_outcomes': An array of key academic and practical learning outcomes.\n"
-                "Output strictly valid JSON matching the exact schema."
-            )
+        # Step 5: Generate synthesized overview & learning outcomes from chapters
+        chapter_summary_for_ai = [
+            {
+                "chapter_no": ch["chapter_no"],
+                "chapter_name": ch["chapter_name"],
+                "start_page": ch["start_page"],
+                "end_page": ch["end_page"],
+                "summary": ch["description"]
+            }
+            for ch in final_chapters
+        ]
 
-            user_prompt = f"""
-Analyze the following extracted PDF text and extract the structured syllabus for:
+        synthesis_prompt = f"""
+You are an expert curriculum specialist.
+Based on the extracted chapters from the textbook below, provide:
+1. 'syllabus_content': A concise 2-3 sentence executive overview of the subject curriculum and its core scope.
+2. 'learning_outcomes': An array of 4-6 key academic and clinical/practical learning outcomes.
+
 Subject Name: {subject_name}
 Subject Code: {subject_code}
 
 ============================================================
-EXTRACTED PDF DOCUMENT TEXT:
+EXTRACTED CHAPTERS:
 ============================================================
-{full_text}
+{json.dumps(chapter_summary_for_ai, indent=2)}
 
-============================================================
-REQUIRED JSON OUTPUT SCHEMA:
-============================================================
+Return strictly valid JSON:
 {{
-  "status": "success",
-  "subject_name": "{subject_name}",
-  "subject_code": "{subject_code}",
-  "syllabus_content": "Detailed overview of human anatomical systems, osteology, arthrology, myology, and systemic organ relations for clinical practice.",
-  "chapters": [
-    {{
-      "chapter_no": "1",
-      "chapter_name": "Introduction to Anatomical Terms & Organization",
-      "description": "Anatomical planes, positions, cavities, cell structure, tissues, and membranes."
-    }},
-    {{
-      "chapter_no": "2",
-      "chapter_name": "The Skeletal & Muscular System",
-      "description": "Axial and appendicular skeleton, joints, muscle classification, and biomechanics."
-    }}
-  ],
+  "syllabus_content": "Executive overview of the curriculum...",
   "learning_outcomes": [
-    "Identify anatomical landmarks on human models and radiographic images",
-    "Correlate anatomical structures with nursing procedures and clinical interventions"
+    "Outcome 1",
+    "Outcome 2"
   ]
 }}
 """
-            response = client.chat.completions.create(
+        try:
+            syn_resp = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "system", "content": "You generate textbook syllabus overviews and learning outcomes. Return valid JSON only."},
+                    {"role": "user", "content": synthesis_prompt}
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.2
             )
-            raw_output = response.choices[0].message.content
-            parsed_result = json.loads(raw_output)
+            syn_json = json.loads(syn_resp.choices[0].message.content)
+            syllabus_content = syn_json.get("syllabus_content") or f"Curriculum overview for {subject_name or 'the subject'}."
+            learning_outcomes = syn_json.get("learning_outcomes") or []
+        except Exception as syn_err:
+            logger.warning(f"Error generating synthesis overview: {syn_err}")
+            syllabus_content = f"Comprehensive curriculum overview for {subject_name or 'the textbook'} covering {len(final_chapters)} major chapters."
+            learning_outcomes = [
+                f"Master key theoretical concepts and principles in {subject_name or 'the subject'}",
+                "Apply core textbook topics to practical and analytical scenarios"
+            ]
 
-        # ======================================================================
-        # PATH B: MULTI-CHUNK SEQUENTIAL EXTRACTION & AGGREGATION (Large PDF / Book)
-        # ======================================================================
-        else:
-            raw_chapters = []
-            raw_learning_outcomes = []
+        response_payload = {
+            "status": "success",
+            "subject_name": subject_name,
+            "subject_code": subject_code,
+            "syllabus_content": syllabus_content,
+            "chapters": final_chapters,
+            "learning_outcomes": learning_outcomes
+        }
 
-            chunk_system_prompt = (
-                "You are an expert curriculum and syllabus extraction specialist. "
-                "Analyze the provided text excerpt from a multi-page document or textbook.\n"
-                "MANDATORY RULES:\n"
-                "1. Extract all syllabus units/chapters, topics covered, and learning outcomes mentioned in this specific excerpt.\n"
-                "2. The provided text is the ONLY source of truth. Do NOT invent chapters or use outside knowledge.\n"
-                "3. If this excerpt contains a Table of Contents (TOC), course outline, or chapter headings, use them to capture accurate chapter names and numbers.\n"
-                "4. Do NOT treat casual body headings, sub-sections, preface remarks, figure captions, or index listings as syllabus chapters.\n"
-                "5. Extract only legitimate curriculum units/chapters with 'chapter_no', 'chapter_name', and a comprehensive 'description'.\n"
-                "6. Extract any explicit or implied learning outcomes/objectives present in this excerpt.\n"
-                "7. If this excerpt does not contain syllabus units or chapters, return empty lists: {\"chapters\": [], \"learning_outcomes\": []}.\n"
-                "Return valid JSON only."
-            )
-
-            for idx, chunk_text in enumerate(chunks, start=1):
-                logger.info(f"Extracting syllabus from Chunk {idx}/{len(chunks)} ({len(chunk_text)} chars)...")
-                chunk_user_prompt = f"""
-Analyze this document excerpt (Chunk {idx} of {len(chunks)}) for:
-Subject Name: {subject_name}
-Subject Code: {subject_code}
-
-============================================================
-EXTRACTED DOCUMENT EXCERPT (Chunk {idx}/{len(chunks)}):
-============================================================
-{chunk_text}
-
-============================================================
-JSON OUTPUT SCHEMA:
-============================================================
-{{
-  "chapters": [
-    {{
-      "chapter_no": "1",
-      "chapter_name": "Chapter or Unit Title",
-      "description": "Comprehensive description of topics and concepts covered in this chapter."
-    }}
-  ],
-  "learning_outcomes": [
-    "Specific learning competency or outcome"
-  ]
-}}
-"""
-                try:
-                    chunk_resp = client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": chunk_system_prompt},
-                            {"role": "user", "content": chunk_user_prompt}
-                        ],
-                        response_format={"type": "json_object"},
-                        temperature=0.2
-                    )
-                    chunk_parsed = json.loads(chunk_resp.choices[0].message.content)
-                    extracted_ch = chunk_parsed.get("chapters", [])
-                    extracted_lo = chunk_parsed.get("learning_outcomes", [])
-
-                    if isinstance(extracted_ch, list):
-                        for ch in extracted_ch:
-                            if isinstance(ch, dict) and ch.get("chapter_name"):
-                                raw_chapters.append(ch)
-
-                    if isinstance(extracted_lo, list):
-                        for lo in extracted_lo:
-                            if isinstance(lo, str) and lo.strip():
-                                raw_learning_outcomes.append(lo.strip())
-
-                except Exception as chunk_err:
-                    logger.warning(f"Error processing chunk {idx}/{len(chunks)}: {str(chunk_err)}")
-
-            logger.info(
-                f"Completed multi-chunk pass. Collected {len(raw_chapters)} raw chapter entries "
-                f"and {len(raw_learning_outcomes)} raw learning outcomes. Aggregating final syllabus..."
-            )
-
-            # Aggregation Step
-            agg_system_prompt = (
-                "You are a master educational curriculum aggregation specialist. "
-                "Your task is to consolidate, deduplicate, and organize the extracted chapters and learning outcomes "
-                "from all chunks of a large textbook/syllabus document into a single, clean, cohesive, ordered syllabus curriculum.\n"
-                "MANDATORY RULES:\n"
-                "1. Merge duplicate chapters (e.g., chapters appearing both in the Table of Contents and in individual chapter body chunks) into single entries with rich, consolidated descriptions.\n"
-                "2. Maintain strict chronological / sequential order of chapters (e.g., Chapter 1, Chapter 2... or Unit I, Unit II...).\n"
-                "3. Deduplicate learning outcomes while preserving specific and actionable competencies.\n"
-                "4. Generate a concise 2-3 sentence 'syllabus_content' executive overview of the subject curriculum and its core scope based ONLY on the extracted content.\n"
-                "5. Do NOT invent new chapters or use outside knowledge. Rely strictly on the provided aggregated data.\n"
-                "6. Return strictly valid JSON matching the exact schema."
-            )
-
-            agg_user_prompt = f"""
-Consolidate the extracted syllabus data below into the final structured curriculum:
-Subject Name: {subject_name}
-Subject Code: {subject_code}
-
-============================================================
-COLLECTED EXTRACTED CHAPTERS ACROSS ALL CHUNKS:
-============================================================
-{json.dumps(raw_chapters, indent=2)}
-
-============================================================
-COLLECTED LEARNING OUTCOMES ACROSS ALL CHUNKS:
-============================================================
-{json.dumps(raw_learning_outcomes, indent=2)}
-
-============================================================
-REQUIRED FINAL JSON OUTPUT SCHEMA:
-============================================================
-{{
-  "status": "success",
-  "subject_name": "{subject_name}",
-  "subject_code": "{subject_code}",
-  "syllabus_content": "Executive overview of the subject curriculum and core scope...",
-  "chapters": [
-    {{
-      "chapter_no": "1",
-      "chapter_name": "Chapter Name",
-      "description": "Comprehensive description of topics covered."
-    }}
-  ],
-  "learning_outcomes": [
-    "Learning outcome competency"
-  ]
-}}
-"""
-            agg_response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": agg_system_prompt},
-                    {"role": "user", "content": agg_user_prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2
-            )
-            parsed_result = json.loads(agg_response.choices[0].message.content)
-
-        # Guarantee status, subject_name, subject_code, chapters, and learning_outcomes
-        parsed_result["status"] = "success"
-        if subject_name and not parsed_result.get("subject_name"):
-            parsed_result["subject_name"] = subject_name
-        if subject_code and not parsed_result.get("subject_code"):
-            parsed_result["subject_code"] = subject_code
-
-        if "chapters" not in parsed_result or not isinstance(parsed_result["chapters"], list):
-            parsed_result["chapters"] = []
-        if "learning_outcomes" not in parsed_result or not isinstance(parsed_result["learning_outcomes"], list):
-            parsed_result["learning_outcomes"] = []
-        if "syllabus_content" not in parsed_result or not parsed_result["syllabus_content"]:
-            parsed_result["syllabus_content"] = f"Curriculum overview for {subject_name or 'the subject'}."
-
-        return jsonify(parsed_result), 200
+        return jsonify(response_payload), 200
 
     except OpenAIError as oe:
         logger.error(f"OpenAI API Error: {str(oe)}", exc_info=True)
