@@ -986,8 +986,8 @@ You are an expert textbook curriculum analyzer.
 Extract the COMPLETE list of ALL major chapters/units and their printed start pages from the Table of Contents text below.
 
 MANDATORY RULES:
-1. Extract EVERY SINGLE authentic chapter/section listed in this Table of Contents from Chapter 1 to the final chapter (e.g. Chapters 1 through 14+). Do NOT stop early or omit later chapters.
-2. Preserve the exact textbook titles (e.g. 'INTRODUCTION TO HUMAN ANATOMY AND PHYSIOLOGY', 'CELL', 'TISSUES AND MEMBRANE', 'THE INTEGUMENTARY SYSTEM', 'THE SKELETAL SYSTEM', 'THE MUSCULAR SYSTEM', 'THE NERVOUS SYSTEM', 'THE ENDOCRINE SYSTEM', 'CARDIOVASCULAR SYSTEM', 'RESPIRATORY SYSTEM', 'DIGESTIVE SYSTEM', 'THE URINARY SYSTEM', 'FLUID AND ELECTROLYTE BALANCE', 'THE REPRODUCTIVE SYSTEM').
+1. Extract EVERY SINGLE authentic chapter/section listed in this Table of Contents from the first chapter to the very last chapter. Do NOT stop early, omit, or summarize chapters.
+2. Preserve the EXACT chapter titles as written in the Table of Contents.
 3. Extract 'chapter_no', 'chapter_name', and 'printed_page' (integer if visible, else null).
 4. Return valid JSON only.
 
@@ -1001,7 +1001,7 @@ JSON SCHEMA:
   "chapters": [
     {{
       "chapter_no": "1",
-      "chapter_name": "INTRODUCTION TO HUMAN ANATOMY AND PHYSIOLOGY",
+      "chapter_name": "EXACT TITLE FROM TOC",
       "printed_page": 1
     }}
   ]
@@ -1536,31 +1536,6 @@ def extract_syllabus():
                 chapter.get("end_page"),
                 len(chapter.get("content", ""))
             )
-
-        if len(final_chapters) < 14:
-            logger.warning("[CHAPTER COUNT WARNING] expected=14 actual=%s", len(final_chapters))
-
-        required_names = [
-            "INTRODUCTION TO HUMAN ANATOMY AND PHYSIOLOGY",
-            "CELL",
-            "TISSUES AND MEMBRANES",
-            "THE INTEGUMENTARY SYSTEM",
-            "THE SKELETAL SYSTEM",
-            "THE MUSCULAR SYSTEM",
-            "THE NERVOUS SYSTEM",
-            "THE ENDOCRINE SYSTEM",
-            "CARDIOVASCULAR SYSTEM",
-            "RESPIRATORY SYSTEM",
-            "DIGESTIVE SYSTEM",
-            "THE URINARY SYSTEM",
-            "FLUID AND ELECTROLYTE BALANCE",
-            "THE REPRODUCTIVE SYSTEM"
-        ]
-        extracted_keys = {normalize_chapter_key(c.get("chapter_name", "")) for c in final_chapters}
-        for name in required_names:
-            n_key = normalize_chapter_key(name)
-            if not any(n_key in ek or ek in n_key for ek in extracted_keys):
-                logger.warning("[MISSING CHAPTER] %s", name)
 
         # Register authentic chapters in textbook registry for subsequent question generation
         register_extracted_textbook(
