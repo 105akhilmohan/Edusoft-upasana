@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import sys
 import json
 import base64
 import logging
@@ -14,12 +15,15 @@ from openai import OpenAI, OpenAIError
 # Load environment variables from .env
 load_dotenv()
 
-# Configure logging
+# Configure logging with immediate stdout streaming
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+    force=True
 )
-logger = logging.getLogger("edusoft_service")
+logger = logging.getLogger(__name__)
+EXTRACTION_DEBUG = os.getenv("EXTRACTION_DEBUG", "false").lower() in ("true", "1")
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -663,11 +667,16 @@ Return JSON with "questions" array. Do NOT include explanations.
 # 3. FULL TEXTBOOK & SYLLABUS PDF EXTRACTION PIPELINE (Reading Order + TOC + Boundaries)
 # ==============================================================================
 
-def extract_page_lines_reading_order(page, page_num):
+def extract_page_lines_reading_order(page, page_num, debug_mode=False):
     """
-    Extract words from a pdfplumber page using bounding-box coordinates to reconstruct
-    natural reading order, handle two-column vs single-column layouts, and repair line-break hyphens.
-    Optimized for low-memory footprint on large textbooks.
+    Coordinate-based word extractor for textbooks:
+    1. Extracts words with font metadata and coordinates.
+    2. Groups words into lines using vertical overlap / height tolerance.
+    3. Dynamically detects columns from x-coordinate distribution (no fixed 50% split).
+    4. Separates full-width headings from column blocks.
+    5. Reconstructs top-to-bottom natural reading order across multi-column pages.
+    6. Repairs line-break hyphenation while preserving genuine compound words.
+    7. Detects and logs suspicious fragments without silently dropping or mangling words.
     """
     try:
         words = page.extract_words(
@@ -675,87 +684,146 @@ def extract_page_lines_reading_order(page, page_num):
             y_tolerance=3,
             keep_blank_chars=False,
             use_text_flow=False,
-            extra_attrs=[]
+            extra_attrs=["fontname", "size"]
         )
     except Exception as e:
-        logger.warning(f"extract_words failed on page {page_num}: {e}. Falling back to extract_text.")
-        try:
-            raw_text = page.extract_text() or ""
-        except Exception:
-            raw_text = ""
-        return [l.strip() for l in raw_text.splitlines() if l.strip()]
+        logger.warning("[EXTRACT FAILED] page=%s error=%s", page_num, str(e))
+        return [], 1, []
 
     if not words:
-        return []
+        return [], 1, []
 
-    page_width = float(page.width or 612.0)
-    page_height = float(page.height or 792.0)
-    mid_x = page_width / 2.0
+    # Step A: Group words into lines using dynamic vertical overlap
+    sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines = []
+    current_line = []
 
-    # Determine if page is two-column
-    left_words = [w for w in words if w["x1"] <= (mid_x - 8)]
-    right_words = [w for w in words if w["x0"] >= (mid_x + 8)]
-    spanning_words = [w for w in words if w["x0"] < mid_x and w["x1"] > mid_x]
+    for w in sorted_words:
+        if not current_line:
+            current_line.append(w)
+            continue
 
-    is_two_column = (
-        len(left_words) > 20 and
-        len(right_words) > 20 and
-        len(spanning_words) < (0.15 * len(words))
-    )
+        line_top = min(item["top"] for item in current_line)
+        line_bottom = max(item["bottom"] for item in current_line)
+        line_height = max(1.0, line_bottom - line_top)
+        w_height = max(1.0, w["bottom"] - w["top"])
 
-    def group_words_into_lines(word_list):
-        if not word_list:
-            return []
-        # Quantize vertical position to group words on the same line
-        sorted_words = sorted(word_list, key=lambda w: (round(w["top"] / 3.5) * 3.5, w["x0"]))
-        lines = []
-        current_line_words = []
-        current_top = None
+        overlap = max(0.0, min(line_bottom, w["bottom"]) - max(line_top, w["top"]))
+        min_h = min(line_height, w_height)
 
-        for w in sorted_words:
-            w_top = w["top"]
-            if current_top is None:
-                current_top = w_top
-                current_line_words.append(w)
-            elif abs(w_top - current_top) <= 3.5:
-                current_line_words.append(w)
-            else:
-                sorted_line = sorted(current_line_words, key=lambda x: x["x0"])
-                line_str = " ".join(x["text"] for x in sorted_line if x.get("text"))
-                if line_str.strip():
-                    lines.append(line_str.strip())
-                current_line_words = [w]
-                current_top = w_top
+        if overlap >= 0.35 * min_h or abs(w["top"] - line_top) <= 3.5:
+            current_line.append(w)
+        else:
+            sorted_l = sorted(current_line, key=lambda x: x["x0"])
+            lines.append({
+                "words": sorted_l,
+                "text": " ".join(x.get("text", "") for x in sorted_l if x.get("text")).strip(),
+                "x0": min(x["x0"] for x in sorted_l),
+                "x1": max(x["x1"] for x in sorted_l),
+                "top": min(x["top"] for x in sorted_l),
+                "bottom": max(x["bottom"] for x in sorted_l),
+                "max_size": max(float(x.get("size", 10.0) or 10.0) for x in sorted_l)
+            })
+            current_line = [w]
 
-        if current_line_words:
-            sorted_line = sorted(current_line_words, key=lambda x: x["x0"])
-            line_str = " ".join(x["text"] for x in sorted_line if x.get("text"))
-            if line_str.strip():
-                lines.append(line_str.strip())
+    if current_line:
+        sorted_l = sorted(current_line, key=lambda x: x["x0"])
+        lines.append({
+            "words": sorted_l,
+            "text": " ".join(x.get("text", "") for x in sorted_l if x.get("text")).strip(),
+            "x0": min(x["x0"] for x in sorted_l),
+            "x1": max(x["x1"] for x in sorted_l),
+            "top": min(x["top"] for x in sorted_l),
+            "bottom": max(x["bottom"] for x in sorted_l),
+            "max_size": max(float(x.get("size", 10.0) or 10.0) for x in sorted_l)
+        })
 
-        return lines
+    # Step B: Dynamic Column Detection
+    min_x = min(l["x0"] for l in lines)
+    max_x = max(l["x1"] for l in lines)
+    content_width = max(1.0, max_x - min_x)
 
-    if is_two_column:
-        header_words = [w for w in spanning_words if w["top"] < (page_height * 0.18)]
-        header_lines = group_words_into_lines(header_words) if header_words else []
+    column_count = 1
+    ordered_lines = []
 
-        left_lines = group_words_into_lines(left_words)
-        right_lines = group_words_into_lines(right_words)
+    if len(lines) >= 8 and content_width >= 200:
+        gutter_min_search = min_x + (content_width * 0.30)
+        gutter_max_search = min_x + (content_width * 0.70)
 
-        footer_words = [w for w in spanning_words if w["top"] > (page_height * 0.85)]
-        footer_lines = group_words_into_lines(footer_words) if footer_words else []
+        slice_candidates = []
+        step = 5.0
+        curr_x = gutter_min_search
+        while curr_x <= gutter_max_search:
+            crossing_count = sum(1 for l in lines if l["x0"] < (curr_x - 6) and l["x1"] > (curr_x + 6))
+            left_count = sum(1 for l in lines if l["x1"] <= (curr_x + 6))
+            right_count = sum(1 for l in lines if l["x0"] >= (curr_x - 6))
+            slice_candidates.append((crossing_count, left_count, right_count, curr_x))
+            curr_x += step
 
-        raw_lines = header_lines + left_lines + right_lines + footer_lines
-    else:
-        raw_lines = group_words_into_lines(words)
+        if slice_candidates:
+            slice_candidates.sort(key=lambda s: (s[0], -min(s[1], s[2])))
+            best_crossing, left_c, right_c, best_gutter_x = slice_candidates[0]
 
-    # Hyphenation repair: join split words across line breaks (e.g. "show-" + "ing" -> "showing")
+            if left_c >= 4 and right_c >= 4 and best_crossing <= (0.22 * len(lines)):
+                column_count = 2
+                gutter_x = best_gutter_x
+
+                current_left = []
+                current_right = []
+
+                def flush_columns():
+                    col_lines = []
+                    if current_left:
+                        current_left.sort(key=lambda l: l["top"])
+                        col_lines.extend(current_left)
+                        current_left.clear()
+                    if current_right:
+                        current_right.sort(key=lambda l: l["top"])
+                        col_lines.extend(current_right)
+                        current_right.clear()
+                    return col_lines
+
+                vertical_sorted_lines = sorted(lines, key=lambda l: l["top"])
+
+                for l in vertical_sorted_lines:
+                    is_spanning = (l["x0"] < (gutter_x - 15) and l["x1"] > (gutter_x + 15)) or ((l["x1"] - l["x0"]) >= 0.70 * content_width)
+                    if is_spanning:
+                        col_lines = flush_columns()
+                        if col_lines:
+                            ordered_lines.extend(col_lines)
+                        ordered_lines.append(l)
+                    elif l["x1"] <= (gutter_x + 8):
+                        current_left.append(l)
+                    elif l["x0"] >= (gutter_x - 8):
+                        current_right.append(l)
+                    else:
+                        if (gutter_x - l["x0"]) > (l["x1"] - gutter_x):
+                            current_left.append(l)
+                        else:
+                            current_right.append(l)
+
+                col_lines = flush_columns()
+                if col_lines:
+                    ordered_lines.extend(col_lines)
+
+    if column_count == 1:
+        ordered_lines = sorted(lines, key=lambda l: l["top"])
+
+    raw_text_lines = [l["text"] for l in ordered_lines if l.get("text")]
+
+    # Step C: Hyphenation repair: join split words across line breaks (e.g. "show-" + "ing" -> "showing")
     fixed_lines = []
+    suspicious_fragments = []
     i = 0
-    while i < len(raw_lines):
-        line = raw_lines[i]
-        if i + 1 < len(raw_lines) and line.endswith("-") and not line.endswith("--"):
-            next_line = raw_lines[i + 1]
+    while i < len(raw_text_lines):
+        line = raw_text_lines[i]
+
+        if re.search(r"\bCh\s+(?:ing|is|made|care|devoted|down|in|it|so|passing)\b", line, re.IGNORECASE):
+            suspicious_fragments.append(line)
+            logger.warning("[SUSPICIOUS TEXT] page=%s line=%r", page_num, line)
+
+        if i + 1 < len(raw_text_lines) and line.endswith("-") and not line.endswith("--"):
+            next_line = raw_text_lines[i + 1]
             first_word_match = re.match(r"^([A-Za-z]+)(.*)$", next_line)
             last_word_match = re.search(r"([A-Za-z]+)-$", line)
             if first_word_match and last_word_match:
@@ -763,21 +831,29 @@ def extract_page_lines_reading_order(page, page_num):
                 suffix = first_word_match.group(1)
                 rest_of_next_line = first_word_match.group(2).strip()
 
-                merged_word = prefix + suffix
-                line_without_hyphen_word = line[:last_word_match.start(1)]
-                new_first_line = (line_without_hyphen_word + merged_word).strip()
-                fixed_lines.append(new_first_line)
+                if suffix.islower() or (prefix.isupper() and suffix.isupper()):
+                    merged_word = prefix + suffix
+                    line_without_hyphen = line[:last_word_match.start(1)]
+                    new_first_line = (line_without_hyphen + merged_word).strip()
+                    fixed_lines.append(new_first_line)
 
-                if rest_of_next_line:
-                    raw_lines[i + 1] = rest_of_next_line
-                    i += 1
-                else:
-                    i += 2
-                continue
+                    if rest_of_next_line:
+                        raw_text_lines[i + 1] = rest_of_next_line
+                        i += 1
+                    else:
+                        i += 2
+                    continue
+
         fixed_lines.append(line)
         i += 1
 
-    return fixed_lines
+    if debug_mode and (suspicious_fragments or page_num <= 5):
+        logger.info(
+            "[DEBUG] Page %s coords: cols=%s | lines=%s | content_w=%.1f | sample=%r",
+            page_num, column_count, len(fixed_lines), content_width, fixed_lines[:3]
+        )
+
+    return fixed_lines, column_count, suspicious_fragments
 
 
 def clean_page_headers_and_footers(page_records):
@@ -803,7 +879,6 @@ def clean_page_headers_and_footers(page_records):
             bottom_line = lines[-1].strip().upper()
             bottom_line_freq[bottom_line] = bottom_line_freq.get(bottom_line, 0) + 1
 
-    # Detect repeated headers/footers appearing on multiple pages (>= 4% of book)
     threshold = max(3, int(total_pages * 0.04)) if total_pages >= 15 else 2
     repeated_top_headers = {k for k, v in top_line_freq.items() if v >= threshold and len(k) > 2}
     repeated_bottom_footers = {k for k, v in bottom_line_freq.items() if v >= threshold and len(k) > 2}
@@ -872,24 +947,22 @@ def detect_table_of_contents_and_chapters(cleaned_pages, client, model, subject_
     """
     Dynamically scans the opening portion of the book for Table of Contents,
     and extracts authentic chapter names directly from the book structure.
-    Returns list of dicts: [{"chapter_no": "1", "chapter_name": "...", "printed_page": 16}, ...]
+    Returns: (list_of_chapters, list_of_toc_page_numbers)
     """
     toc_text_pages = []
     toc_detected = False
-    toc_start_page = None
+    toc_page_numbers = []
 
-    # Dynamically search opening pages (up to first 60 pages) for TOC
-    max_search_pages = min(len(cleaned_pages), 60)
+    max_search_pages = min(len(cleaned_pages), 80)
     for p in cleaned_pages[:max_search_pages]:
         txt_upper = p["text"].upper()
         if any(h in txt_upper for h in ["CONTENTS", "TABLE OF CONTENTS", "INDEX OF CHAPTERS", "LIST OF CHAPTERS"]):
             toc_detected = True
-            if toc_start_page is None:
-                toc_start_page = p["page_number"]
+            toc_page_numbers.append(p["page_number"])
             toc_text_pages.append(f"--- PAGE {p['page_number']} ---\n{p['text']}")
         elif toc_detected:
-            # Continue collecting consecutive TOC pages
             if re.search(r"(\.{3,}|\b(?:chapter|unit|section|part)\b|\b\d{1,4}\b)", p["text"], re.I):
+                toc_page_numbers.append(p["page_number"])
                 toc_text_pages.append(f"--- PAGE {p['page_number']} ---\n{p['text']}")
             else:
                 break
@@ -897,7 +970,7 @@ def detect_table_of_contents_and_chapters(cleaned_pages, client, model, subject_
     toc_combined = "\n\n".join(toc_text_pages)
 
     if toc_combined and len(toc_combined) > 40:
-        logger.info(f"TOC pages detected: {len(toc_text_pages)} (Starting at page {toc_start_page})")
+        logger.info("[TOC] Detected TOC pages: %s", toc_page_numbers)
         toc_prompt = f"""
 You are an expert textbook curriculum analyzer.
 Extract the exact major chapters/units and their printed start pages from the Table of Contents text below.
@@ -940,7 +1013,6 @@ JSON SCHEMA:
                 clean_extracted = []
                 for idx, c in enumerate(extracted, start=1):
                     c_name = str(c.get("chapter_name", "")).strip()
-                    # Filter out short invalid artifacts
                     if c_name and len(c_name) >= 3 and not c_name.lower().startswith("ch "):
                         clean_extracted.append({
                             "chapter_no": str(c.get("chapter_no") or idx),
@@ -948,10 +1020,10 @@ JSON SCHEMA:
                             "printed_page": c.get("printed_page")
                         })
                 if clean_extracted:
-                    logger.info(f"Chapters detected from TOC: {len(clean_extracted)}")
-                    return clean_extracted
+                    logger.info("[CHAPTER] Detected %s chapters", len(clean_extracted))
+                    return clean_extracted, toc_page_numbers
         except Exception as toc_err:
-            logger.warning(f"Error extracting TOC via OpenAI: {toc_err}")
+            logger.warning("[TOC ERROR] Error extracting TOC via OpenAI: %s", str(toc_err))
 
     # Fallback: Structural scan for explicit "CHAPTER I: ...", "CHAPTER 1 - ...", "UNIT 1: ..."
     logger.info("Scanning document for explicit chapter/unit headings via structural patterns...")
@@ -962,7 +1034,6 @@ JSON SCHEMA:
         p_num = p["page_number"]
         for line in p["lines"][:8]:
             line_str = line.strip()
-            # Match strictly explicit chapter titles (e.g. "CHAPTER 1. THE SCALP", "CHAPTER I — THE SKULL")
             m = re.match(r"^(?:CHAPTER|UNIT|SECTION|PART)\s+([0-9IVXLCDM]+)[\s:\.\-—]+([A-Za-z0-9\s,\-\(\)]{3,80})$", line_str, re.IGNORECASE)
             if m:
                 ch_num = m.group(1).strip()
@@ -977,29 +1048,51 @@ JSON SCHEMA:
                     })
 
     if discovered_chapters:
-        logger.info(f"Discovered {len(discovered_chapters)} chapters from structural heading scan.")
-        return discovered_chapters
+        logger.info("[CHAPTER] Detected %s chapters", len(discovered_chapters))
+        return discovered_chapters, toc_page_numbers
 
-    # Ultimate fallback: single chapter representing the whole textbook
+    logger.info("[CHAPTER] Detected 1 chapter (fallback)")
     return [{
         "chapter_no": "1",
         "chapter_name": subject_name or "Textbook Curriculum Content",
         "start_page": cleaned_pages[0]["page_number"] if cleaned_pages else 1
-    }]
+    }], toc_page_numbers
 
 
 def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name=""):
     """
     Locates exact start_page and end_page for every chapter using standalone heading matching
-    and proximity search, preventing paragraph substrings from falsely matching.
+    and dynamic offset calculation, preventing paragraph substrings from falsely matching.
     Extracts the 100% COMPLETE readable textbook text belonging to each chapter.
     """
     if not cleaned_pages:
-        return []
+        return [], 0
 
     all_page_numbers = [p["page_number"] for p in cleaned_pages]
     page_lookup = {p["page_number"]: p for p in cleaned_pages}
 
+    # Step 1: Calculate dynamic offset consensus (PDF page - Printed page)
+    offset_samples = []
+    for c in chapter_map:
+        c_name = c["chapter_name"].strip()
+        c_printed = c.get("printed_page")
+        c_name_norm = re.sub(r"[^\w\s]", "", c_name.upper()).strip()
+
+        if c_printed and isinstance(c_printed, int):
+            for p in cleaned_pages:
+                for line in p.get("lines", [])[:12]:
+                    line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
+                    if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
+                        offset_samples.append(p["page_number"] - c_printed)
+                        break
+
+    median_offset = 0
+    if offset_samples:
+        offset_samples.sort()
+        median_offset = offset_samples[len(offset_samples) // 2]
+        logger.info("[OFFSET] Dynamic consensus offset calculated: %s (samples=%s)", median_offset, offset_samples)
+
+    # Step 2: Match exact standalone heading lines for every chapter
     positioned_chapters = []
 
     for c in chapter_map:
@@ -1010,51 +1103,43 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
 
         matched_page = None
 
-        # Strategy 1: Proximity search around printed_page (±45 pages)
-        candidate_pages = []
+        # Strategy A: Targeted search around expected PDF page using dynamic offset
         if c_printed and isinstance(c_printed, int):
-            candidate_pages = [p for p in cleaned_pages if abs(p["page_number"] - c_printed) <= 45]
-        
-        # Check candidate pages first for standalone line match
-        for p in candidate_pages:
-            p_lines = p.get("lines", [])
-            for line in p_lines[:12]:  # Headings appear in top 12 lines of chapter start page
-                line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
-                # Exact line match or explicit chapter title line
-                if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
-                    matched_page = p["page_number"]
-                    break
-            if matched_page is not None:
-                break
-
-        # Strategy 2: Search all pages for standalone heading line
-        if matched_page is None:
-            for p in cleaned_pages:
-                p_lines = p.get("lines", [])
-                for line in p_lines[:12]:
+            expected_pdf_p = c_printed + median_offset
+            candidate_pages = [p for p in cleaned_pages if abs(p["page_number"] - expected_pdf_p) <= 25]
+            for p in candidate_pages:
+                for line in p.get("lines", [])[:12]:
                     line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
                     if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
-                        matched_page = p["page_number"]
-                        break
-                    elif c_name_norm in line_clean and len(line_clean) <= len(c_name_norm) + 15:
-                        # Near exact line match
                         matched_page = p["page_number"]
                         break
                 if matched_page is not None:
                     break
 
-        # Log match or rejection
-        if matched_page is not None:
-            logger.info(f"Chapter heading matched: '{c_name}' -> PDF page {matched_page}")
-        else:
-            # Fallback to existing start_page or printed_page if within page bounds
+        # Strategy B: Document-wide scan for standalone heading line
+        if matched_page is None:
+            for p in cleaned_pages:
+                for line in p.get("lines", [])[:12]:
+                    line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
+                    if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
+                        matched_page = p["page_number"]
+                        break
+                    elif c_name_norm in line_clean and len(line_clean) <= len(c_name_norm) + 12:
+                        matched_page = p["page_number"]
+                        break
+                if matched_page is not None:
+                    break
+
+        if matched_page is None:
             if c.get("start_page"):
                 matched_page = c["start_page"]
+            elif c_printed and (c_printed + median_offset) in page_lookup:
+                matched_page = c_printed + median_offset
             elif c_printed and c_printed in page_lookup:
                 matched_page = c_printed
             else:
                 matched_page = all_page_numbers[0]
-            logger.warning(f"WARNING: rejected possible chapter heading: '{c_name}' (No standalone heading line found, assigned to page {matched_page})")
+            logger.warning("[CHAPTER REJECTED] page=%s candidate=%r reason=%s", matched_page, c_name, "No standalone heading line found; defaulted to page")
 
         positioned_chapters.append({
             "chapter_no": c_no or str(len(positioned_chapters) + 1),
@@ -1062,10 +1147,9 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
             "start_page": matched_page
         })
 
-    # Sort chapters strictly by start_page
     positioned_chapters.sort(key=lambda x: x["start_page"])
 
-    # Resolve end_page and assemble 100% COMPLETE original cleaned content per chapter
+    # Step 3: Resolve end_page and assemble 100% COMPLETE readable textbook content
     final_chapters = []
     total_assigned_pages = 0
 
@@ -1077,9 +1161,8 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
         else:
             end_p = all_page_numbers[-1]
 
-        logger.info(f"Chapter boundary: '{ch['chapter_name']}' pages {start_p}-{end_p}")
+        logger.info("[CHAPTER] #%s | %s | PDF pages %s-%s", ch["chapter_no"], ch["chapter_name"], start_p, end_p)
 
-        # Gather ALL pages from start_p to end_p
         chapter_pages_text = []
         for p in cleaned_pages:
             if start_p <= p["page_number"] <= end_p:
@@ -1093,7 +1176,11 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
                     full_content = f"--- PAGE {p['page_number']} ---\n{p['text']}"
                     break
 
-        # Generate concise description separately from first few content paragraphs
+        logger.info(
+            "[CHAPTER CONTENT] #%s %s | pages=%s-%s | characters=%s",
+            ch["chapter_no"], ch["chapter_name"], start_p, end_p, len(full_content)
+        )
+
         sample_snippet = full_content[:3000] if full_content else ch["chapter_name"]
         desc_lines = [l.strip() for l in sample_snippet.splitlines() if len(l.strip()) > 30 and not l.strip().startswith("---")]
         if desc_lines:
@@ -1109,10 +1196,11 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
             "start_page": start_p,
             "end_page": end_p,
             "description": description,
-            "content": full_content  # COMPLETE READABLE ORIGINAL TEXTBOOK CONTENT PRESERVED!
+            "content": full_content
         })
 
-    logger.info(f"Total pages assigned: {total_assigned_pages}")
+    logger.info("[COMPLETE] PDF extraction finished | pages=%s | chapters=%s", len(cleaned_pages), len(final_chapters))
+    logger.info("========== PDF EXTRACTION END ==========")
     return final_chapters, total_assigned_pages
 
 
@@ -1134,6 +1222,9 @@ def extract_syllabus():
         raw_page_records = []
         total_pages = 0
         pages_with_text = 0
+        detected_column_counts = []
+        all_suspicious_pages = set()
+        all_suspicious_fragments = []
 
         # Case 1: multipart/form-data upload
         if request.files:
@@ -1175,19 +1266,33 @@ def extract_syllabus():
         else:
             model = DEFAULT_MODEL or "gpt-4o-mini"
 
+        logger.info("========== PDF EXTRACTION START ==========")
+        logger.info("PDF: %s", temp_pdf_path or "Direct Text Input")
+
         # Step 1: Extract all pages with bounding-box coordinate reading order
         if temp_pdf_path and os.path.exists(temp_pdf_path):
             try:
                 import pdfplumber
                 with pdfplumber.open(temp_pdf_path) as pdf:
                     total_pages = len(pdf.pages)
-                    logger.info(f"Total PDF pages: {total_pages}")
+                    logger.info("Total PDF pages: %s", total_pages)
+
                     for page_num, page in enumerate(pdf.pages, start=1):
-                        lines = extract_page_lines_reading_order(page, page_num)
+                        lines, col_count, suspicious = extract_page_lines_reading_order(
+                            page=page,
+                            page_num=page_num,
+                            debug_mode=EXTRACTION_DEBUG
+                        )
+                        detected_column_counts.append(col_count)
+                        if suspicious:
+                            all_suspicious_pages.add(page_num)
+                            all_suspicious_fragments.extend(suspicious)
+
                         try:
                             page.flush_cache()
                         except Exception:
                             pass
+
                         if lines:
                             clean_t = "\n".join(lines).strip()
                             raw_page_records.append({
@@ -1197,7 +1302,23 @@ def extract_syllabus():
                             })
                             pages_with_text += 1
 
-                        # Periodic garbage collection for large textbooks
+                        logger.info(
+                            "[EXTRACT] Page %s/%s | words=%s | lines=%s | columns=%s",
+                            page_num,
+                            total_pages,
+                            sum(len(l.split()) for l in lines),
+                            len(lines),
+                            col_count
+                        )
+
+                        if page_num % 10 == 0 or page_num == total_pages:
+                            logger.info(
+                                "[PROGRESS] Extracted %s/%s pages (%.1f%%)",
+                                page_num,
+                                total_pages,
+                                page_num / total_pages * 100
+                            )
+
                         if page_num % 25 == 0:
                             gc.collect()
 
@@ -1243,8 +1364,8 @@ def extract_syllabus():
 
             total_pages = len(raw_page_records)
             pages_with_text = len(raw_page_records)
+            detected_column_counts = [1] * total_pages
 
-        # Graceful handling of scanned/image-only PDFs
         if not raw_page_records or pages_with_text == 0:
             return jsonify({
                 "status": "error",
@@ -1258,13 +1379,11 @@ def extract_syllabus():
                 "pages_with_text": 0
             }), 400
 
-        logger.info(f"Pages with text: {pages_with_text}")
-
         # Step 2: Clean repeated running headers & footers conservatively
         cleaned_pages = clean_page_headers_and_footers(raw_page_records)
 
         # Step 3: Dynamically detect Table of Contents & authentic chapter list
-        chapter_map = detect_table_of_contents_and_chapters(
+        chapter_map, toc_page_numbers = detect_table_of_contents_and_chapters(
             cleaned_pages=cleaned_pages,
             client=client,
             model=model,
@@ -1278,6 +1397,8 @@ def extract_syllabus():
             subject_name=subject_name
         )
 
+        avg_columns = (sum(detected_column_counts) / len(detected_column_counts)) if detected_column_counts else 1
+
         # Build final response payload matching exact requested schema
         response_payload = {
             "status": "success",
@@ -1289,8 +1410,12 @@ def extract_syllabus():
             "extraction_metadata": {
                 "total_pdf_pages": total_pages,
                 "pages_with_text": pages_with_text,
+                "toc_pages_detected": len(toc_page_numbers),
                 "chapters_detected": len(final_chapters),
-                "pages_assigned_to_chapters": total_pages_assigned
+                "pages_assigned_to_chapters": total_pages_assigned,
+                "columns_detected": round(avg_columns),
+                "suspicious_pages": len(all_suspicious_pages),
+                "suspicious_fragments": len(all_suspicious_fragments)
             }
         }
 
@@ -1326,3 +1451,4 @@ if __name__ == "__main__":
     debug = os.getenv("FLASK_ENV", "production").lower() == "development"
     logger.info(f"Starting Edusoft AI server on port {port} (debug={debug})")
     app.run(host="0.0.0.0", port=port, debug=debug)
+
