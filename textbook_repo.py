@@ -215,6 +215,7 @@ def register_extracted_textbook(subject_name: str, subject_code: str, chapters: 
     """
     Registers authentic textbook chapters extracted directly from a PDF.
     Preserves 100% full chapter content and original textbook chapter names.
+    Stores all extracted chapters (all 14+) without truncation or key overwriting.
     """
     if not chapters:
         return
@@ -226,13 +227,18 @@ def register_extracted_textbook(subject_name: str, subject_code: str, chapters: 
     if registry_key not in EXTRACTED_TEXTBOOK_REGISTRY:
         EXTRACTED_TEXTBOOK_REGISTRY[registry_key] = {}
 
-    for ch in chapters:
+    reg_dict = EXTRACTED_TEXTBOOK_REGISTRY[registry_key]
+    reg_dict["__chapters_list__"] = []
+
+    for idx, ch in enumerate(chapters, start=1):
         chapter_name = str(ch.get("chapter_name", "")).strip()
         chapter_key = normalize_chapter_key(chapter_name)
+        ch_num = str(ch.get("chapter_no") or idx).strip()
         ch_id = str(ch.get("chapter_id") or chapter_key)
+
         record = {
             "chapter_id": ch_id,
-            "chapter_no": str(ch.get("chapter_no", "")),
+            "chapter_no": ch_num,
             "chapter_name": chapter_name,
             "chapter_key": chapter_key,
             "chapter_name_source": ch.get("chapter_name_source", "textbook_pdf"),
@@ -243,20 +249,43 @@ def register_extracted_textbook(subject_name: str, subject_code: str, chapters: 
             "description": ch.get("description", ""),
             "content": ch.get("content", "")
         }
-        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][ch_id] = record
-        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][chapter_key] = record
-        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][chapter_name.lower()] = record
+
+        # Store distinct record in sequential chapters list
+        reg_dict["__chapters_list__"].append(record)
+        # Store multiple alias mappings for flexible retrieval without losing records
+        reg_dict[ch_id] = record
+        reg_dict[chapter_key] = record
+        reg_dict[chapter_name.lower()] = record
+        reg_dict[f"chapter_{ch_num}"] = record
+        reg_dict[f"unit_{ch_num}"] = record
+        reg_dict[ch_num] = record
+
+    stored_list = reg_dict.get("__chapters_list__", [])
+    logger.info(
+        "[REGISTRY] registry_key=%s chapter_count=%s",
+        registry_key,
+        len(stored_list)
+    )
+
+    for i, record in enumerate(stored_list, start=1):
         logger.info(
-            "[REGISTRY]\nchapter_id=%r\nchapter_name=%r\nchapter_key=%r",
-            ch_id, chapter_name, chapter_key
+            "[REGISTRY CHAPTER] #%s key=%s name=%r",
+            record.get("chapter_no", str(i)),
+            record.get("chapter_key"),
+            record.get("chapter_name")
         )
 
-    logger.info(f"Registered {len(chapters)} authentic chapters in textbook registry for {registry_key}")
+    if len(stored_list) != len(chapters):
+        logger.error(
+            "[REGISTRY LOSS] extracted=%s registered=%s",
+            len(chapters),
+            len(stored_list)
+        )
 
 
 def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_identifier: str, payload_content: str = None) -> dict:
     """
-    Retrieve authentic textbook chapter record using class, subject, and chapter_id/name.
+    Retrieve authentic textbook chapter record using class, subject, and chapter_id/name/number.
     Returns dictionary with keys: chapter_id, chapter_name, content, chapter_name_source, chapter_name_verified.
     """
     chap_id = str(chapter_identifier or "").strip()
@@ -272,8 +301,8 @@ def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_iden
             "chapter_name_verified": True
         }
         logger.info(
-            "[TEXTBOOK LOOKUP]\nregistry_key='payload'\nchapter_id=%s\nchapter_name=%s",
-            record["chapter_id"], record["chapter_name"]
+            "[QUESTION REQUEST] chapter_id=%r chapter_name=%r content_length=%s",
+            record["chapter_id"], record["chapter_name"], len(record["content"])
         )
         return record
 
@@ -282,28 +311,48 @@ def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_iden
     chap_norm = normalize_chapter_key(chap_id)
     chap_lower = chap_id.lower()
 
+    # Extract any chapter/unit number from identifier (e.g. "unit_5_..." -> "5")
+    num_match = re.search(r"\b(?:unit|chapter|ch)?\s*([0-9]{1,2})\b", chap_id, re.IGNORECASE)
+    extracted_num = num_match.group(1) if num_match else None
+
     # 2. Check EXTRACTED_TEXTBOOK_REGISTRY
     search_keys = [f"{cls_key}:{subj_key}", f"all:{subj_key}"]
     for reg_k in search_keys:
         if reg_k in EXTRACTED_TEXTBOOK_REGISTRY:
             reg_dict = EXTRACTED_TEXTBOOK_REGISTRY[reg_k]
             matched_rec = None
-            if chap_id in reg_dict:
+
+            # Priority 1: Exact direct key lookup
+            if chap_id in reg_dict and not chap_id.startswith("__"):
                 matched_rec = reg_dict[chap_id]
-            elif chap_norm in reg_dict:
+            elif chap_norm in reg_dict and not chap_norm.startswith("__"):
                 matched_rec = reg_dict[chap_norm]
-            elif chap_lower in reg_dict:
+            elif chap_lower in reg_dict and not chap_lower.startswith("__"):
                 matched_rec = reg_dict[chap_lower]
-            else:
-                for k, rec in reg_dict.items():
-                    if chap_norm and (chap_norm in k or k in chap_norm):
+            elif extracted_num and extracted_num in reg_dict:
+                matched_rec = reg_dict[extracted_num]
+            elif extracted_num and f"chapter_{extracted_num}" in reg_dict:
+                matched_rec = reg_dict[f"chapter_{extracted_num}"]
+
+            # Priority 2: Scan sequential chapters list for title / substring / number match
+            if not matched_rec:
+                chapters_list = reg_dict.get("__chapters_list__", [])
+                for rec in chapters_list:
+                    rec_name_norm = normalize_chapter_key(rec.get("chapter_name", ""))
+                    rec_no = str(rec.get("chapter_no", "")).strip()
+                    if extracted_num and rec_no == extracted_num:
+                        matched_rec = rec
+                        break
+                    if chap_norm and (chap_norm in rec_name_norm or rec_name_norm in chap_norm):
                         matched_rec = rec
                         break
 
             if matched_rec:
                 logger.info(
-                    "[TEXTBOOK LOOKUP]\nregistry_key=%s\nchapter_id=%s\nchapter_name=%s",
-                    reg_k, matched_rec.get("chapter_id"), matched_rec.get("chapter_name")
+                    "[QUESTION REQUEST] chapter_id=%r chapter_name=%r content_length=%s",
+                    chap_id,
+                    matched_rec.get("chapter_name"),
+                    len(matched_rec.get("content", ""))
                 )
                 if len(matched_rec.get("content", "").strip()) < 1000:
                     logger.warning(
@@ -325,8 +374,8 @@ def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_iden
                 "chapter_name_verified": True
             }
             logger.info(
-                "[TEXTBOOK LOOKUP]\nregistry_key=%s\nchapter_id=%s\nchapter_name=%s",
-                f"{cls_key}:{subj_key}", rec["chapter_id"], rec["chapter_name"]
+                "[QUESTION REQUEST] chapter_id=%r chapter_name=%r content_length=%s",
+                rec["chapter_id"], rec["chapter_name"], len(rec["content"])
             )
             return rec
 
@@ -341,8 +390,8 @@ def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_iden
         "chapter_name_verified": False
     }
     logger.info(
-        "[TEXTBOOK LOOKUP]\nregistry_key='synthesized'\nchapter_id=%s\nchapter_name=%s",
-        rec["chapter_id"], rec["chapter_name"]
+        "[QUESTION REQUEST] chapter_id=%r chapter_name=%r content_length=%s",
+        rec["chapter_id"], rec["chapter_name"], len(rec["content"])
     )
     return rec
 

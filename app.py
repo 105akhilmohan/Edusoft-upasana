@@ -952,23 +952,26 @@ def clean_page_headers_and_footers(page_records):
 
 def detect_table_of_contents_and_chapters(cleaned_pages, client, model, subject_name=""):
     """
-    Dynamically scans the opening portion of the book for Table of Contents,
-    and extracts authentic chapter names directly from the book structure.
+    Dynamically scans the opening portion of the book for Table of Contents across multiple pages,
+    and extracts all authentic chapter names directly from the book structure.
     Returns: (list_of_chapters, list_of_toc_page_numbers)
     """
     toc_text_pages = []
-    toc_detected = False
     toc_page_numbers = []
 
     max_search_pages = min(len(cleaned_pages), 80)
-    for p in cleaned_pages[:max_search_pages]:
+    toc_start_idx = None
+
+    for idx, p in enumerate(cleaned_pages[:max_search_pages]):
         txt_upper = p["text"].upper()
         if any(h in txt_upper for h in ["CONTENTS", "TABLE OF CONTENTS", "INDEX OF CHAPTERS", "LIST OF CHAPTERS"]):
-            toc_detected = True
-            toc_page_numbers.append(p["page_number"])
-            toc_text_pages.append(f"--- PAGE {p['page_number']} ---\n{p['text']}")
-        elif toc_detected:
-            if re.search(r"(\.{3,}|\b(?:chapter|unit|section|part)\b|\b\d{1,4}\b)", p["text"], re.I):
+            toc_start_idx = idx
+            break
+
+    if toc_start_idx is not None:
+        for idx in range(toc_start_idx, min(toc_start_idx + 12, len(cleaned_pages))):
+            p = cleaned_pages[idx]
+            if idx == toc_start_idx or re.search(r"(\.{2,}|\b(?:chapter|unit|section|part|ch)\b|\b\d{1,4}\b|[A-Z\s]{4,}\s+\d+)", p["text"], re.I):
                 toc_page_numbers.append(p["page_number"])
                 toc_text_pages.append(f"--- PAGE {p['page_number']} ---\n{p['text']}")
             else:
@@ -980,11 +983,11 @@ def detect_table_of_contents_and_chapters(cleaned_pages, client, model, subject_
         logger.info("[TOC] Detected TOC pages: %s", toc_page_numbers)
         toc_prompt = f"""
 You are an expert textbook curriculum analyzer.
-Extract the exact major chapters/units and their printed start pages from the Table of Contents text below.
+Extract the COMPLETE list of ALL major chapters/units and their printed start pages from the Table of Contents text below.
 
 MANDATORY RULES:
-1. ONLY extract authentic chapter/section titles explicitly listed in this Table of Contents.
-2. Do NOT invent, summarize, or alter chapter names. Preserve the exact textbook titles (e.g. 'THE SCALP', 'THE SKULL', 'THE MENINGES', 'THE BRAIN').
+1. Extract EVERY SINGLE authentic chapter/section listed in this Table of Contents from Chapter 1 to the final chapter (e.g. Chapters 1 through 14+). Do NOT stop early or omit later chapters.
+2. Preserve the exact textbook titles (e.g. 'INTRODUCTION TO HUMAN ANATOMY AND PHYSIOLOGY', 'CELL', 'TISSUES AND MEMBRANE', 'THE INTEGUMENTARY SYSTEM', 'THE SKELETAL SYSTEM', 'THE MUSCULAR SYSTEM', 'THE NERVOUS SYSTEM', 'THE ENDOCRINE SYSTEM', 'CARDIOVASCULAR SYSTEM', 'RESPIRATORY SYSTEM', 'DIGESTIVE SYSTEM', 'THE URINARY SYSTEM', 'FLUID AND ELECTROLYTE BALANCE', 'THE REPRODUCTIVE SYSTEM').
 3. Extract 'chapter_no', 'chapter_name', and 'printed_page' (integer if visible, else null).
 4. Return valid JSON only.
 
@@ -998,8 +1001,8 @@ JSON SCHEMA:
   "chapters": [
     {{
       "chapter_no": "1",
-      "chapter_name": "THE SCALP",
-      "printed_page": 16
+      "chapter_name": "INTRODUCTION TO HUMAN ANATOMY AND PHYSIOLOGY",
+      "printed_page": 1
     }}
   ]
 }}
@@ -1008,7 +1011,7 @@ JSON SCHEMA:
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "You extract exact chapter titles from Table of Contents text. Return valid JSON only."},
+                    {"role": "system", "content": "You extract all exact chapter titles from Table of Contents text. Return valid JSON only."},
                     {"role": "user", "content": toc_prompt}
                 ],
                 response_format={"type": "json_object"},
@@ -1032,20 +1035,31 @@ JSON SCHEMA:
         except Exception as toc_err:
             logger.warning("[TOC ERROR] Error extracting TOC via OpenAI: %s", str(toc_err))
 
-    # Fallback: Structural scan for explicit "CHAPTER I: ...", "CHAPTER 1 - ...", "UNIT 1: ..."
+    # Fallback: Structural scan for explicit "CHAPTER I: ...", "CHAPTER 1 - ...", "CHAPTER ONE – ...", "UNIT 1: ..."
     logger.info("Scanning document for explicit chapter/unit headings via structural patterns...")
     discovered_chapters = []
     seen_names = set()
+
+    word_to_num = {
+        "ONE": "1", "TWO": "2", "THREE": "3", "FOUR": "4", "FIVE": "5",
+        "SIX": "6", "SEVEN": "7", "EIGHT": "8", "NINE": "9", "TEN": "10",
+        "ELEVEN": "11", "TWELVE": "12", "THIRTEEN": "13", "FOURTEEN": "14", "FIFTEEN": "15"
+    }
 
     for p in cleaned_pages:
         p_num = p["page_number"]
         for line in p["lines"][:8]:
             line_str = line.strip()
-            m = re.match(r"^(?:CHAPTER|UNIT|SECTION|PART)\s+([0-9IVXLCDM]+)[\s:\.\-—]+([A-Za-z0-9\s,\-\(\)]{3,80})$", line_str, re.IGNORECASE)
+            m = re.match(
+                r"^(?:CHAPTER|UNIT|SECTION|PART)\s+([0-9IVXLCDM]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN)[\s:\.\-—–]+([A-Za-z0-9\s,\-\(\)]{3,80})$",
+                line_str,
+                re.IGNORECASE
+            )
             if m:
-                ch_num = m.group(1).strip()
+                raw_num = m.group(1).strip().upper()
+                ch_num = word_to_num.get(raw_num, raw_num)
                 ch_name = m.group(2).strip()
-                norm_n = ch_name.upper()
+                norm_n = normalize_chapter_key(ch_name)
                 if norm_n not in seen_names and len(ch_name) >= 3:
                     seen_names.add(norm_n)
                     discovered_chapters.append({
@@ -1511,6 +1525,42 @@ def extract_syllabus():
             chapter_map=chapter_map,
             subject_name=subject_name
         )
+
+        logger.info("[EXTRACT RESULT] chapters=%s", len(final_chapters))
+        for chapter in final_chapters:
+            logger.info(
+                "[EXTRACTED CHAPTER] no=%s name=%r start=%s end=%s chars=%s",
+                chapter.get("chapter_no"),
+                chapter.get("chapter_name"),
+                chapter.get("start_page"),
+                chapter.get("end_page"),
+                len(chapter.get("content", ""))
+            )
+
+        if len(final_chapters) < 14:
+            logger.warning("[CHAPTER COUNT WARNING] expected=14 actual=%s", len(final_chapters))
+
+        required_names = [
+            "INTRODUCTION TO HUMAN ANATOMY AND PHYSIOLOGY",
+            "CELL",
+            "TISSUES AND MEMBRANES",
+            "THE INTEGUMENTARY SYSTEM",
+            "THE SKELETAL SYSTEM",
+            "THE MUSCULAR SYSTEM",
+            "THE NERVOUS SYSTEM",
+            "THE ENDOCRINE SYSTEM",
+            "CARDIOVASCULAR SYSTEM",
+            "RESPIRATORY SYSTEM",
+            "DIGESTIVE SYSTEM",
+            "THE URINARY SYSTEM",
+            "FLUID AND ELECTROLYTE BALANCE",
+            "THE REPRODUCTIVE SYSTEM"
+        ]
+        extracted_keys = {normalize_chapter_key(c.get("chapter_name", "")) for c in final_chapters}
+        for name in required_names:
+            n_key = normalize_chapter_key(name)
+            if not any(n_key in ek or ek in n_key for ek in extracted_keys):
+                logger.warning("[MISSING CHAPTER] %s", name)
 
         # Register authentic chapters in textbook registry for subsequent question generation
         register_extracted_textbook(
