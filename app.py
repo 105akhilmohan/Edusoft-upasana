@@ -329,7 +329,8 @@ from textbook_repo import (
     validate_question,
     normalize_text_for_comparison,
     normalize_class,
-    normalize_subject
+    normalize_subject,
+    normalize_chapter_key
 )
 
 # ==============================================================================
@@ -427,9 +428,7 @@ def generate_questions():
             }), 404
 
         logger.info(
-            "Generating questions: Class=%r Subject=%r Chapter=%r",
-            class_name,
-            subject_name,
+            "[QUESTION GENERATION]\nChapter=%r",
             real_chapter_name
         )
 
@@ -1028,7 +1027,7 @@ JSON SCHEMA:
                             "printed_page": c.get("printed_page")
                         })
                 if clean_extracted:
-                    logger.info("[CHAPTER] Detected %s chapters", len(clean_extracted))
+                    logger.info("[TOC] Detected %s textbook chapters", len(clean_extracted))
                     return clean_extracted, toc_page_numbers
         except Exception as toc_err:
             logger.warning("[TOC ERROR] Error extracting TOC via OpenAI: %s", str(toc_err))
@@ -1056,10 +1055,10 @@ JSON SCHEMA:
                     })
 
     if discovered_chapters:
-        logger.info("[CHAPTER] Detected %s chapters", len(discovered_chapters))
+        logger.info("[TOC] Detected %s textbook chapters", len(discovered_chapters))
         return discovered_chapters, toc_page_numbers
 
-    logger.info("[CHAPTER] Detected 1 chapter (fallback)")
+    logger.info("[TOC] Detected 1 textbook chapter (fallback)")
     return [{
         "chapter_no": "1",
         "chapter_name": subject_name or "Textbook Curriculum Content",
@@ -1067,9 +1066,79 @@ JSON SCHEMA:
     }], toc_page_numbers
 
 
+def check_page_for_heading(page_dict, c_name_norm, c_no=""):
+    """
+    Look for candidate chapter heading in the top portion (first 18 lines) of a page.
+    Supports:
+    - one-line exact heading
+    - multiple consecutive lines forming the heading (wrapped headings)
+    - explicit CHAPTER/UNIT heading followed by title or title on subsequent lines
+    - whitespace and punctuation normalized only for comparison
+    """
+    lines = page_dict.get("lines", [])[:18]
+    if not lines or not c_name_norm:
+        return False
+
+    def clean_str(s):
+        s = s.replace("&", " AND ")
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.upper())).strip()
+
+    target_clean = clean_str(c_name_norm)
+    if not target_clean:
+        return False
+
+    clean_lines = [clean_str(l) for l in lines if clean_str(l)]
+    if not clean_lines:
+        return False
+
+    # 1. Single line checks
+    for l in clean_lines:
+        if l == target_clean:
+            return True
+        if l.startswith("CHAPTER") or l.startswith("UNIT") or l.startswith("SECTION") or l.startswith("PART"):
+            if target_clean in l:
+                return True
+        elif target_clean in l and len(l) <= len(target_clean) + 15:
+            return True
+
+    # 2. Consecutive 2-line checks
+    for idx in range(len(clean_lines) - 1):
+        l1 = clean_lines[idx]
+        l2 = clean_lines[idx + 1]
+        comb = f"{l1} {l2}".strip()
+        if comb == target_clean:
+            return True
+        if (comb.startswith("CHAPTER") or comb.startswith("UNIT") or comb.startswith("SECTION") or comb.startswith("PART")) and target_clean in comb:
+            return True
+        if target_clean in comb and len(comb) <= len(target_clean) + 20:
+            return True
+        if re.match(r"^(?:CHAPTER|UNIT|SECTION|PART)\s+[0-9IVXLCDM]+$", l1):
+            if l2 == target_clean or (target_clean in l2 and len(l2) <= len(target_clean) + 15):
+                return True
+
+    # 3. Consecutive 3-line checks
+    for idx in range(len(clean_lines) - 2):
+        l1 = clean_lines[idx]
+        l2 = clean_lines[idx + 1]
+        l3 = clean_lines[idx + 2]
+        comb = f"{l1} {l2} {l3}".strip()
+        if comb == target_clean:
+            return True
+        if (comb.startswith("CHAPTER") or comb.startswith("UNIT") or comb.startswith("SECTION") or comb.startswith("PART")) and target_clean in comb:
+            return True
+        if target_clean in comb and len(comb) <= len(target_clean) + 25:
+            return True
+        if re.match(r"^(?:CHAPTER|UNIT|SECTION|PART)\s+[0-9IVXLCDM]+$", l1):
+            comb_23 = f"{l2} {l3}".strip()
+            if comb_23 == target_clean or (target_clean in comb_23 and len(comb_23) <= len(target_clean) + 20):
+                return True
+
+    return False
+
+
 def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name=""):
     """
-    Locates exact start_page and end_page for every chapter using standalone heading matching
+    Locates exact start_page and end_page for every chapter using multi-line wrapped heading matching
     and dynamic offset calculation, preventing paragraph substrings from falsely matching.
     Extracts the 100% COMPLETE readable textbook text belonging to each chapter.
     """
@@ -1084,15 +1153,13 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
     for c in chapter_map:
         c_name = c["chapter_name"].strip()
         c_printed = c.get("printed_page")
-        c_name_norm = re.sub(r"[^\w\s]", "", c_name.upper()).strip()
+        c_no = str(c.get("chapter_no", ""))
 
         if c_printed and isinstance(c_printed, int):
             for p in cleaned_pages:
-                for line in p.get("lines", [])[:12]:
-                    line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
-                    if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
-                        offset_samples.append(p["page_number"] - c_printed)
-                        break
+                if check_page_for_heading(p, c_name, c_no):
+                    offset_samples.append(p["page_number"] - c_printed)
+                    break
 
     median_offset = 0
     if offset_samples:
@@ -1100,85 +1167,110 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
         median_offset = offset_samples[len(offset_samples) // 2]
         logger.info("[OFFSET] Dynamic consensus offset calculated: %s (samples=%s)", median_offset, offset_samples)
 
-    # Step 2: Match exact standalone heading lines for every chapter
+    # Step 2: Match exact standalone heading lines for every chapter with multi-stage bounded windows
     positioned_chapters = []
 
     for c in chapter_map:
         c_name = c["chapter_name"].strip()
         c_no = str(c.get("chapter_no", ""))
         c_printed = c.get("printed_page")
-        c_name_norm = re.sub(r"[^\w\s]", "", c_name.upper()).strip()
 
-        matched_page = None
+        mapped_page = None
+        if c_printed and isinstance(c_printed, int):
+            mapped_page = c_printed + median_offset
+        elif c.get("start_page"):
+            mapped_page = c["start_page"]
+
+        actual_heading_page = None
         is_verified = False
 
-        # Strategy A: Targeted search around expected PDF page using dynamic offset
-        if c_printed and isinstance(c_printed, int):
-            expected_pdf_p = c_printed + median_offset
-            candidate_pages = [p for p in cleaned_pages if abs(p["page_number"] - expected_pdf_p) <= 25]
-            for p in candidate_pages:
-                for line in p.get("lines", [])[:12]:
-                    line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
-                    if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
-                        matched_page = p["page_number"]
-                        is_verified = True
-                        break
-                if matched_page is not None:
+        # STEP 3 & 4: Search reasonable window around mapped_page
+        if mapped_page is not None:
+            # Window 1: mapped_page - 5 through mapped_page + 8
+            w1_pages = [p for p in cleaned_pages if (mapped_page - 5) <= p["page_number"] <= (mapped_page + 8)]
+            for p in w1_pages:
+                if check_page_for_heading(p, c_name, c_no):
+                    actual_heading_page = p["page_number"]
+                    is_verified = True
                     break
 
-        # Strategy B: Document-wide scan for standalone heading line
-        if matched_page is None:
+            # Window 2: wider bounded window mapped_page - 15 through mapped_page + 25
+            if actual_heading_page is None:
+                w2_pages = [p for p in cleaned_pages if (mapped_page - 15) <= p["page_number"] <= (mapped_page + 25)]
+                for p in w2_pages:
+                    if check_page_for_heading(p, c_name, c_no):
+                        actual_heading_page = p["page_number"]
+                        is_verified = True
+                        break
+
+        # Window 3: Document-wide scan across all pages
+        if actual_heading_page is None:
             for p in cleaned_pages:
-                for line in p.get("lines", [])[:12]:
-                    line_clean = re.sub(r"[^\w\s]", "", line.upper()).strip()
-                    if line_clean == c_name_norm or (line_clean.startswith("CHAPTER") and c_name_norm in line_clean):
-                        matched_page = p["page_number"]
-                        is_verified = True
-                        break
-                    elif c_name_norm in line_clean and len(line_clean) <= len(c_name_norm) + 12:
-                        matched_page = p["page_number"]
-                        is_verified = True
-                        break
-                if matched_page is not None:
+                if check_page_for_heading(p, c_name, c_no):
+                    actual_heading_page = p["page_number"]
+                    is_verified = True
                     break
 
-        if matched_page is None:
-            if c.get("start_page"):
-                matched_page = c["start_page"]
-            elif c_printed and (c_printed + median_offset) in page_lookup:
-                matched_page = c_printed + median_offset
-            elif c_printed and c_printed in page_lookup:
-                matched_page = c_printed
-            else:
-                matched_page = all_page_numbers[0]
-            logger.warning("[CHAPTER REJECTED] page=%s candidate=%r reason=%s", matched_page, c_name, "No standalone heading line found; defaulted to page")
+        if is_verified:
+            logger.info(
+                "[CHAPTER VERIFY]\ncandidate=%r\nmapped_page=%s\nactual_heading_page=%s\nverified=true",
+                c_name, mapped_page, actual_heading_page
+            )
+            final_start_page = actual_heading_page
+        else:
+            logger.warning(
+                "[CHAPTER UNVERIFIED] name=%r toc_page=%s mapped_page=%s",
+                c_name, c_printed, mapped_page
+            )
+            final_start_page = mapped_page if (mapped_page and mapped_page in page_lookup) else (c_printed if c_printed and c_printed in page_lookup else None)
 
         positioned_chapters.append({
-            "chapter_no": c_no or str(len(positioned_chapters) + 1),
+            "chapter_no": c_no,
             "chapter_name": c_name,
-            "start_page": matched_page,
+            "start_page": final_start_page,
             "verified": is_verified
         })
 
-    positioned_chapters.sort(key=lambda x: x["start_page"])
+    # Filter out chapters without any start_page and sort strictly by chronological start_page
+    valid_positioned = [ch for ch in positioned_chapters if ch["start_page"] is not None]
+    if not valid_positioned and cleaned_pages:
+        valid_positioned = [{
+            "chapter_no": "1",
+            "chapter_name": subject_name or "Textbook Curriculum Content",
+            "start_page": cleaned_pages[0]["page_number"],
+            "verified": False
+        }]
+
+    valid_positioned.sort(key=lambda x: x["start_page"])
 
     # Step 3: Resolve end_page and assemble 100% COMPLETE readable textbook content
     final_chapters = []
     total_assigned_pages = 0
 
-    for i, ch in enumerate(positioned_chapters):
+    for i, ch in enumerate(valid_positioned):
         start_p = ch["start_page"]
-        if i + 1 < len(positioned_chapters):
-            next_start_p = positioned_chapters[i + 1]["start_page"]
+        if i + 1 < len(valid_positioned):
+            next_start_p = valid_positioned[i + 1]["start_page"]
             end_p = max(start_p, next_start_p - 1)
         else:
             end_p = all_page_numbers[-1]
 
-        logger.info("[TEXTBOOK CHAPTER] #%s name=%r start=%s end=%s", ch["chapter_no"], ch["chapter_name"], start_p, end_p)
+        ch_num = ch["chapter_no"] or str(i + 1)
+
+        logger.info(
+            "[TEXTBOOK CHAPTER]\n#%s name=%r\nstart=%s\nend=%s",
+            ch_num, ch["chapter_name"], start_p, end_p
+        )
         if ch.get("verified"):
-            logger.info("[CHAPTER VERIFIED] name=%r source=%s", ch["chapter_name"], "textbook_pdf")
+            logger.info(
+                "[CHAPTER VERIFIED]\nname=%r\nsource=textbook_pdf",
+                ch["chapter_name"]
+            )
         else:
-            logger.warning("[CHAPTER VERIFICATION FAILED] name=%r", ch["chapter_name"])
+            logger.warning(
+                "[CHAPTER UNVERIFIED] name=%r",
+                ch["chapter_name"]
+            )
 
         chapter_pages_text = []
         for p in cleaned_pages:
@@ -1194,9 +1286,15 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
                     break
 
         logger.info(
-            "[CHAPTER CONTENT] name=%r characters=%s",
+            "[CHAPTER CONTENT]\nname=%r\ncharacters=%s",
             ch["chapter_name"], len(full_content)
         )
+
+        if len(full_content.strip()) < 1000:
+            logger.warning(
+                "[SHORT CHAPTER CONTENT] name=%r characters=%s",
+                ch["chapter_name"], len(full_content)
+            )
 
         sample_snippet = full_content[:3000] if full_content else ch["chapter_name"]
         desc_lines = [l.strip() for l in sample_snippet.splitlines() if len(l.strip()) > 30 and not l.strip().startswith("---")]
@@ -1207,12 +1305,11 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
         else:
             description = f"Comprehensive curriculum and textbook coverage of {ch['chapter_name']}."
 
-        ch_id = re.sub(r"[^\w\s]", "", ch["chapter_name"].lower()).strip().replace(" ", "_")
-        ch_id = re.sub(r"_+", "_", ch_id)
+        ch_id = normalize_chapter_key(ch["chapter_name"])
 
         final_chapters.append({
             "chapter_id": ch_id,
-            "chapter_no": ch["chapter_no"],
+            "chapter_no": ch_num,
             "chapter_name": ch["chapter_name"],
             "chapter_name_source": "textbook_pdf",
             "chapter_name_verified": ch.get("verified", True),
@@ -1223,7 +1320,7 @@ def build_full_chapters_with_boundaries(cleaned_pages, chapter_map, subject_name
             "content": full_content
         })
 
-    logger.info("[EXTRACTION COMPLETE] pages=%s chapters=%s", len(cleaned_pages), len(final_chapters))
+    logger.info("[EXTRACTION COMPLETE]\npages=%s\nchapters=%s", len(cleaned_pages), len(final_chapters))
     return final_chapters, total_assigned_pages
 
 

@@ -130,6 +130,36 @@ PRIMARY_FORBIDDEN_CONCEPTS = [
 ]
 
 
+def normalize_chapter_key(name) -> str:
+    """
+    Normalize a textbook chapter name only for INTERNAL LOOKUP.
+    Never use this value as the display chapter name.
+    """
+    if name is None:
+        return ""
+
+    value = str(name).strip().lower()
+    value = re.sub(r"\s+", " ", value)
+    value = value.replace("&", "and")
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    value = re.sub(r"_+", "_", value)
+    return value.strip("_")
+
+
+def synthesize_curriculum_content(class_name: str, subject_name: str, chapter_identifier: str) -> str:
+    """
+    Synthesizes grade-bound curriculum bounds only as a fallback if no textbook PDF was uploaded.
+    """
+    cls_str = str(class_name or "1").strip()
+    subj_str = str(subject_name or "General").strip()
+    chap_str = str(chapter_identifier or "Curriculum Unit").strip()
+    return (
+        f"CURRICULUM CONTENT FOR CLASS {cls_str.upper()} - SUBJECT: {subj_str.upper()}\n"
+        f"CHAPTER: {chap_str.upper()}\n\n"
+        f"Core syllabus topics, standard terminology, and learning outcomes for {chap_str}."
+    )
+
+
 def normalize_class(class_name: str) -> str:
     """Normalize class name to clean standard digit string (e.g. 'Class 1' -> '1')."""
     if not class_name:
@@ -197,12 +227,14 @@ def register_extracted_textbook(subject_name: str, subject_code: str, chapters: 
         EXTRACTED_TEXTBOOK_REGISTRY[registry_key] = {}
 
     for ch in chapters:
-        ch_id = str(ch.get("chapter_id") or normalize_chapter_key(ch.get("chapter_name", "")))
-        ch_name = str(ch.get("chapter_name", "")).strip()
+        chapter_name = str(ch.get("chapter_name", "")).strip()
+        chapter_key = normalize_chapter_key(chapter_name)
+        ch_id = str(ch.get("chapter_id") or chapter_key)
         record = {
             "chapter_id": ch_id,
             "chapter_no": str(ch.get("chapter_no", "")),
-            "chapter_name": ch_name,
+            "chapter_name": chapter_name,
+            "chapter_key": chapter_key,
             "chapter_name_source": ch.get("chapter_name_source", "textbook_pdf"),
             "chapter_name_verified": ch.get("chapter_name_verified", True),
             "source_pdf_page": ch.get("source_pdf_page") or ch.get("start_page"),
@@ -212,8 +244,12 @@ def register_extracted_textbook(subject_name: str, subject_code: str, chapters: 
             "content": ch.get("content", "")
         }
         EXTRACTED_TEXTBOOK_REGISTRY[registry_key][ch_id] = record
-        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][normalize_chapter_key(ch_name)] = record
-        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][ch_name.lower()] = record
+        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][chapter_key] = record
+        EXTRACTED_TEXTBOOK_REGISTRY[registry_key][chapter_name.lower()] = record
+        logger.info(
+            "[REGISTRY]\nchapter_id=%r\nchapter_name=%r\nchapter_key=%r",
+            ch_id, chapter_name, chapter_key
+        )
 
     logger.info(f"Registered {len(chapters)} authentic chapters in textbook registry for {registry_key}")
 
@@ -224,19 +260,21 @@ def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_iden
     Returns dictionary with keys: chapter_id, chapter_name, content, chapter_name_source, chapter_name_verified.
     """
     chap_id = str(chapter_identifier or "").strip()
-    logger.info("Looking up textbook: class=%r subject=%r chapter_id=%r", class_name, subject_name, chap_id)
 
     # 1. Payload-supplied content
     if payload_content and isinstance(payload_content, str) and len(payload_content.strip()) > 20:
         record = {
             "chapter_id": normalize_chapter_key(chap_id),
             "chapter_name": chap_id or subject_name or "Textbook Chapter",
+            "chapter_key": normalize_chapter_key(chap_id),
             "content": payload_content.strip(),
             "chapter_name_source": "payload_supplied",
             "chapter_name_verified": True
         }
-        logger.info("Resolved textbook chapter: chapter_name=%r", record["chapter_name"])
-        logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", record["chapter_id"], record["chapter_name"], len(record["content"]))
+        logger.info(
+            "[TEXTBOOK LOOKUP]\nregistry_key='payload'\nchapter_id=%s\nchapter_name=%s",
+            record["chapter_id"], record["chapter_name"]
+        )
         return record
 
     cls_key = normalize_class(class_name)
@@ -249,26 +287,30 @@ def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_iden
     for reg_k in search_keys:
         if reg_k in EXTRACTED_TEXTBOOK_REGISTRY:
             reg_dict = EXTRACTED_TEXTBOOK_REGISTRY[reg_k]
+            matched_rec = None
             if chap_id in reg_dict:
-                rec = reg_dict[chap_id]
-                logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
-                logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
-                return rec
-            if chap_norm in reg_dict:
-                rec = reg_dict[chap_norm]
-                logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
-                logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
-                return rec
-            if chap_lower in reg_dict:
-                rec = reg_dict[chap_lower]
-                logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
-                logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
-                return rec
-            for k, rec in reg_dict.items():
-                if chap_norm in k or k in chap_norm:
-                    logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
-                    logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
-                    return rec
+                matched_rec = reg_dict[chap_id]
+            elif chap_norm in reg_dict:
+                matched_rec = reg_dict[chap_norm]
+            elif chap_lower in reg_dict:
+                matched_rec = reg_dict[chap_lower]
+            else:
+                for k, rec in reg_dict.items():
+                    if chap_norm and (chap_norm in k or k in chap_norm):
+                        matched_rec = rec
+                        break
+
+            if matched_rec:
+                logger.info(
+                    "[TEXTBOOK LOOKUP]\nregistry_key=%s\nchapter_id=%s\nchapter_name=%s",
+                    reg_k, matched_rec.get("chapter_id"), matched_rec.get("chapter_name")
+                )
+                if len(matched_rec.get("content", "").strip()) < 1000:
+                    logger.warning(
+                        "[SHORT CHAPTER CONTENT] name=%r characters=%s",
+                        matched_rec.get("chapter_name"), len(matched_rec.get("content", ""))
+                    )
+                return matched_rec
 
     # 3. Check local curated database
     if cls_key in TEXTBOOK_DATABASE:
@@ -277,25 +319,31 @@ def get_textbook_chapter_record(class_name: str, subject_name: str, chapter_iden
             rec = {
                 "chapter_id": chap_norm,
                 "chapter_name": chap_id,
+                "chapter_key": chap_norm,
                 "content": subj_dict[chap_norm],
                 "chapter_name_source": "textbook_db",
                 "chapter_name_verified": True
             }
-            logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
-            logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+            logger.info(
+                "[TEXTBOOK LOOKUP]\nregistry_key=%s\nchapter_id=%s\nchapter_name=%s",
+                f"{cls_key}:{subj_key}", rec["chapter_id"], rec["chapter_name"]
+            )
             return rec
 
     # 4. Fallback: synthesizes grade-bound curriculum bounds only if textbook PDF was not uploaded
     synthetic_content = synthesize_curriculum_content(class_name, subject_name, chap_id)
     rec = {
         "chapter_id": chap_norm or "general_chapter",
-        "chapter_name": chap_id or subject_name,
+        "chapter_name": chap_id or subject_name or "Curriculum Unit",
+        "chapter_key": chap_norm or "general_chapter",
         "content": synthetic_content,
         "chapter_name_source": "curriculum_synthesized",
         "chapter_name_verified": False
     }
-    logger.info("Resolved textbook chapter: chapter_name=%r", rec["chapter_name"])
-    logger.info("Retrieved textbook chapter: id=%s, name=%s, content_length=%s", rec["chapter_id"], rec["chapter_name"], len(rec["content"]))
+    logger.info(
+        "[TEXTBOOK LOOKUP]\nregistry_key='synthesized'\nchapter_id=%s\nchapter_name=%s",
+        rec["chapter_id"], rec["chapter_name"]
+    )
     return rec
 
 
