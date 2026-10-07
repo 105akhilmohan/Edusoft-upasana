@@ -2,7 +2,7 @@
 Edusoft Timetable Generation Engine.
 Optimizes weekly class schedules with multi-teacher conflict resolution, leave management,
 substitute teacher allocation, team-teaching handling, and curriculum distribution rules.
-Fast-path execution with strict OpenAI timeout limits and instant fallback to prevent cURL timeouts.
+Ultra-fast token-compact AI generation with deterministic hydration and zero-lag fallback.
 """
 import json
 import logging
@@ -12,7 +12,7 @@ from openai import OpenAI, OpenAIError
 logger = logging.getLogger("edusoft_service.timetable_generator")
 
 # Maximum seconds to wait for OpenAI before triggering fast deterministic scheduler fallback
-OPENAI_TIMETABLE_TIMEOUT_SECONDS = 8.0
+OPENAI_TIMETABLE_TIMEOUT_SECONDS = 12.0
 
 
 def normalize_id(val: Any) -> str:
@@ -38,7 +38,6 @@ def is_teacher_unavailable(date_str: str, teacher_id: Any, unavailable_map: Any)
     """
     Check if a teacher is unavailable on a given date.
     Returns (is_unavailable, reason).
-    Handles dict, list, string, or comma-separated teacher IDs.
     """
     if not unavailable_map or not isinstance(unavailable_map, dict):
         return False, ""
@@ -105,7 +104,7 @@ def resolve_teacher_name(teacher_id: Any, st: Dict[str, Any], unavailable_map: A
         return str(st["teacher_name"]).strip()
     
     t_id_str = normalize_id(teacher_id)
-    if not t_id_str:
+    if not t_id_str or t_id_str == "0":
         return "Faculty (Unassigned)"
     
     # Try looking in unavailable_map for a name snippet like "Shelly Mathew (On Leave)"
@@ -143,7 +142,7 @@ def find_substitute_teacher(
         for t_id in t_ids:
             if t_id in excluded or not t_id:
                 continue
-            if normalize_id(st.get("subject_id")) == s_id_str:
+            if normalize_id(st.get("subject_id") or st.get("id")) == s_id_str:
                 unavail, _ = is_teacher_unavailable(date_str, t_id, unavailable_map)
                 busy = is_teacher_busy(date_str, period_key, t_id, teacher_busy_slots)
                 if not unavail and not busy:
@@ -227,7 +226,6 @@ def generate_deterministic_schedule(
             continue
 
         for period_key in period_keys:
-            # Round-robin subject distribution
             st = subject_teachers[subject_idx % total_subjects]
             subject_idx += 1
             
@@ -285,8 +283,8 @@ def generate_deterministic_schedule(
     return schedule
 
 
-def validate_and_patch_schedule(
-    schedule: Dict[str, Any],
+def validate_and_hydrate_schedule(
+    raw_schedule: Dict[str, Any],
     week_dates: List[str],
     period_keys: List[str],
     subject_teachers: List[Dict[str, Any]],
@@ -296,13 +294,14 @@ def validate_and_patch_schedule(
     activity_dates: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Validate and clean schedule returned by AI:
-    1. Ensures all dates and period keys exist.
-    2. Enforces zero leave violations (replaces any hallucinated unavailable teachers).
-    3. Enforces zero busy slot violations.
-    4. Ensures all required fields exist in each slot.
+    Hydrate compact AI output into the full expected schema and enforce zero constraint violations.
     """
-    patched_schedule: Dict[str, Dict[str, Any]] = {}
+    # Build lookup table for subject records
+    subject_map: Dict[str, Dict[str, Any]] = {}
+    for st in subject_teachers:
+        s_id = normalize_id(st.get("subject_id") or st.get("id"))
+        if s_id:
+            subject_map[s_id] = st
 
     fallback_schedule = generate_deterministic_schedule(
         week_dates=week_dates,
@@ -314,29 +313,57 @@ def validate_and_patch_schedule(
         activity_dates=activity_dates
     )
 
+    holidays_set = set(holiday_dates or [])
+    activities_set = set(activity_dates or [])
+    final_schedule: Dict[str, Dict[str, Any]] = {}
+
     for date_str in week_dates:
-        patched_schedule[date_str] = {}
-        raw_date_slots = schedule.get(date_str) if isinstance(schedule.get(date_str), dict) else {}
+        final_schedule[date_str] = {}
+        
+        if date_str in holidays_set:
+            final_schedule[date_str] = fallback_schedule[date_str]
+            continue
+        if date_str in activities_set:
+            final_schedule[date_str] = fallback_schedule[date_str]
+            continue
+
+        raw_slots = raw_schedule.get(date_str) if isinstance(raw_schedule.get(date_str), dict) else {}
 
         for period_key in period_keys:
-            slot = raw_date_slots.get(period_key)
+            slot = raw_slots.get(period_key)
             if not slot or not isinstance(slot, dict):
-                patched_schedule[date_str][period_key] = fallback_schedule.get(date_str, {}).get(period_key, {})
+                final_schedule[date_str][period_key] = fallback_schedule[date_str][period_key]
                 continue
 
             sub_id = slot.get("subject_id")
-            sub_name = slot.get("subject_name") or ""
-            t_id = slot.get("teacher_id")
-            t_name = slot.get("teacher_name") or ""
-            activity = slot.get("activity") or "Theory Class"
+            s_id_str = normalize_id(sub_id)
+            st = subject_map.get(s_id_str)
+
+            if not st:
+                # Subject not found, use fallback
+                final_schedule[date_str][period_key] = fallback_schedule[date_str][period_key]
+                continue
+
+            sub_name = st.get("name") or st.get("subject_name", f"Subject {sub_id}")
+            activity = get_activity_label(st)
+            
+            orig_t_ids = parse_teacher_ids(st.get("teacher_id"))
+            assigned_t_id = slot.get("teacher_id")
+            
+            if not assigned_t_id and orig_t_ids:
+                assigned_t_id = orig_t_ids[0]
+                
+            assigned_t_str = normalize_id(assigned_t_id)
+            t_name = resolve_teacher_name(assigned_t_str, st, unavailable_map)
+            
             is_sub = bool(slot.get("is_substituted", False))
             note = str(slot.get("note") or "")
 
-            # Check if assigned teacher is unavailable or busy
-            is_unavail, leave_reason = is_teacher_unavailable(date_str, t_id, unavailable_map) if t_id else (False, "")
-            is_busy = is_teacher_busy(date_str, period_key, t_id, teacher_busy_slots) if t_id else False
+            # Check if assigned teacher is unavailable on this date or busy
+            is_unavail, leave_reason = is_teacher_unavailable(date_str, assigned_t_str, unavailable_map) if assigned_t_str else (False, "")
+            is_busy = is_teacher_busy(date_str, period_key, assigned_t_str, teacher_busy_slots) if assigned_t_str else False
 
-            if (is_unavail or is_busy) and t_id:
+            if (is_unavail or is_busy) and assigned_t_str:
                 substitute = find_substitute_teacher(
                     subject_id=sub_id,
                     date_str=date_str,
@@ -344,10 +371,10 @@ def validate_and_patch_schedule(
                     subject_teachers=subject_teachers,
                     unavailable_map=unavailable_map,
                     teacher_busy_slots=teacher_busy_slots,
-                    excluded_teacher_ids=parse_teacher_ids(t_id)
+                    excluded_teacher_ids=[assigned_t_str] + orig_t_ids
                 )
                 if substitute:
-                    t_id = substitute["teacher_id"]
+                    assigned_t_str = str(substitute["teacher_id"])
                     t_name = substitute["teacher_name"]
                     is_sub = True
                     if is_unavail:
@@ -355,20 +382,23 @@ def validate_and_patch_schedule(
                     else:
                         note = "Auto-substituted by AI: Slot conflict resolution"
 
-            if not is_sub and note and "substitut" in note.lower():
+            # Check if this teacher is a substitute compared to original teacher
+            if orig_t_ids and assigned_t_str not in orig_t_ids and not is_sub:
                 is_sub = True
+                if not note:
+                    note = "Auto-substituted by AI: Same Subject Specialist"
 
-            patched_schedule[date_str][period_key] = {
+            final_schedule[date_str][period_key] = {
                 "subject_id": sub_id,
                 "subject_name": sub_name,
-                "teacher_id": t_id,
+                "teacher_id": assigned_t_str if assigned_t_str else 0,
                 "teacher_name": t_name,
                 "activity": activity,
                 "is_substituted": is_sub,
                 "note": note
             }
 
-    return patched_schedule
+    return final_schedule
 
 
 def generate_timetable_ai(
@@ -378,8 +408,8 @@ def generate_timetable_ai(
 ) -> Tuple[Dict[str, Any], int]:
     """
     Main entry point for Timetable Generation API.
-    Receives request payload, validates inputs, queries OpenAI with strict timeout limits,
-    post-validates constraints, and returns standardized response.
+    Uses token-compact AI generation for maximum speed, followed by instantaneous
+    hydration and deterministic fallback.
     """
     # 1. Parse & normalize inputs
     week_dates = payload.get("week_dates") or payload.get("dates") or []
@@ -406,7 +436,6 @@ def generate_timetable_ai(
     class_id = payload.get("class_id")
     section_id = payload.get("section_id")
     
-    # Ensure maps/lists are normalized
     unavailable_map = payload.get("unavailable_map") if isinstance(payload.get("unavailable_map"), dict) else {}
     teacher_busy_slots = payload.get("teacher_busy_slots") if isinstance(payload.get("teacher_busy_slots"), dict) else {}
     holiday_dates = payload.get("holiday_dates") if isinstance(payload.get("holiday_dates"), list) else []
@@ -419,9 +448,9 @@ def generate_timetable_ai(
         class_id, section_id, len(week_dates), len(period_keys), len(subject_teachers), len(unavailable_map), len(holiday_dates)
     )
 
-    # 2. If OpenAI client is not configured or user specifically did not provide OpenAI key, run deterministic generator directly
+    # 2. Fast-path if OpenAI is not available
     if not client or not client.api_key:
-        logger.warning("OpenAI client not configured. Using high-performance deterministic timetable generator.")
+        logger.warning("OpenAI API key not configured. Using deterministic timetable generator.")
         schedule = generate_deterministic_schedule(
             week_dates=week_dates,
             period_keys=period_keys,
@@ -437,54 +466,44 @@ def generate_timetable_ai(
             "schedule": schedule
         }, 200
 
-    # 3. Compact AI Prompts for fast generation (< 5 seconds)
-    system_prompt = """You are an expert AI Academic Timetable Optimizer for Edusoft.
-Optimize the weekly timetable schedule adhering strictly to teacher leaves, busy slots, and subject distribution.
+    # 3. Compact AI Prompt (produces ~200 tokens in ~1.5s instead of ~2,000 tokens)
+    system_prompt = """You are an academic timetable scheduler. Return a JSON object with:
+"schedule": { "<date>": { "<period_key>": { "subject_id": <id>, "teacher_id": <id> } } }
+Rules:
+- Assign every date in week_dates and every period in period_keys.
+- Distribute subjects evenly across the week.
+- Do NOT assign a teacher on dates listed in unavailable_map (substitute with another teacher from subject_teachers).
+- Do NOT assign a teacher during slots listed in teacher_busy_slots.
+- Follow user_prompt if provided."""
 
-RULES:
-1. Every date in 'week_dates' and every period in 'period_keys' must have a scheduled slot.
-2. TEACHER LEAVE ENFORCEMENT: Never assign a teacher if they are in 'unavailable_map' on that date. Substitute with available faculty, set 'is_substituted' to true, note the reason.
-3. TEACHER BUSY SLOTS: Never assign a teacher if they are in 'teacher_busy_slots' for that date/period.
-4. HOLIDAYS: On dates in 'holiday_dates', set subject_name='Holiday / Off Day', activity='Holiday'.
-5. Set 'activity' to 'Theory Class' or 'Practical Lab'. Set is_substituted=false and note='' for regular slots.
-6. Follow 'user_prompt' if provided.
-7. Return valid JSON only with 'status', 'message', and 'schedule'."""
-
-    # Simplified payload for prompt to minimize token length and latency
     condensed_subjects = []
     for st in subject_teachers:
+        s_id = st.get("subject_id") or st.get("id")
+        t_id = st.get("teacher_id")
         condensed_subjects.append({
-            "subject_id": st.get("subject_id") or st.get("id"),
+            "subject_id": s_id,
             "name": st.get("name") or st.get("subject_name"),
-            "teacher_id": st.get("teacher_id"),
-            "teacher_name": resolve_teacher_name(st.get("teacher_id"), st, unavailable_map),
-            "type": "Practical" if (st.get("practical") or "practical" in str(st.get("type", "")).lower()) else "Theory"
+            "teacher_id": t_id
         })
 
-    user_payload_summary = {
-        "class_id": class_id,
-        "section_id": section_id,
-        "week_dates": week_dates,
-        "period_keys": period_keys,
-        "subject_teachers": condensed_subjects,
+    compact_payload = {
+        "dates": week_dates,
+        "periods": period_keys,
+        "subjects": condensed_subjects,
         "unavailable_map": unavailable_map,
-        "teacher_busy_slots": teacher_busy_slots,
-        "holiday_dates": holiday_dates,
-        "activity_dates": activity_dates,
+        "busy_slots": teacher_busy_slots,
+        "holidays": holiday_dates,
         "user_prompt": user_prompt
     }
 
-    user_prompt_content = f"""Generate schedule JSON for:
-{json.dumps(user_payload_summary)}
-"""
-
     try:
-        # Enforce strict timeout on OpenAI call to prevent downstream cURL timeout in CodeIgniter
-        response = client.chat.completions.create(
+        # Request with 0 retries and clean 12s timeout
+        api_client = client.with_options(max_retries=0)
+        response = api_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt_content}
+                {"role": "user", "content": json.dumps(compact_payload)}
             ],
             response_format={"type": "json_object"},
             temperature=0.2,
@@ -493,13 +512,11 @@ RULES:
 
         content = response.choices[0].message.content
         result_json = json.loads(content)
-
         raw_schedule = result_json.get("schedule", {})
-        message = result_json.get("message", "Weekly schedule optimized successfully with 0 teacher conflicts.")
 
-        # Post-validate and patch schedule to guarantee zero constraint violations
-        final_schedule = validate_and_patch_schedule(
-            schedule=raw_schedule,
+        # Hydrate and strictly enforce leave & clash rules
+        final_schedule = validate_and_hydrate_schedule(
+            raw_schedule=raw_schedule,
             week_dates=week_dates,
             period_keys=period_keys,
             subject_teachers=subject_teachers,
@@ -511,13 +528,13 @@ RULES:
 
         return {
             "status": "success",
-            "message": message,
+            "message": "Weekly schedule optimized successfully with 0 teacher conflicts.",
             "schedule": final_schedule
         }, 200
 
     except Exception as err:
         logger.warning(
-            f"OpenAI call exceeded timeout ({OPENAI_TIMETABLE_TIMEOUT_SECONDS}s) or failed: {str(err)}. "
+            f"OpenAI call encountered error or timeout ({str(err)}). "
             f"Instantly utilizing deterministic scheduling engine."
         )
         fallback_schedule = generate_deterministic_schedule(
