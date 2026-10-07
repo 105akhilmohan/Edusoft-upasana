@@ -38,6 +38,9 @@ client = OpenAI(api_key=openai_api_key)
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
+from timetable_generator import generate_timetable_ai
+
+
 @app.after_request
 def log_response_status(response):
     """Log incoming request method, path, and HTTP response status code."""
@@ -51,12 +54,13 @@ def index():
         "service": "Edusoft AI Analytics & Question Generator API",
         "status": "online",
         "status_code": 200,
-        "version": "1.3.0",
+        "version": "1.4.0",
         "endpoints": {
             "health": "GET /health",
             "generate_insights": "POST /api/generate-insights",
             "generate_questions": "POST /api/generate-questions",
-            "extract_syllabus": "POST /api/extract-syllabus"
+            "extract_syllabus": "POST /api/extract-syllabus",
+            "generate_timetable": "POST /api/generate-timetable"
         }
     }), 200
 
@@ -1591,6 +1595,54 @@ def extract_syllabus():
             except Exception:
                 pass
         gc.collect()
+
+
+
+# ==============================================================================
+# 4. TIMETABLE GENERATION & OPTIMIZATION ENDPOINT
+# ==============================================================================
+@app.route("/api/generate-timetable", methods=["POST"])
+@app.route("/generate-timetable", methods=["POST"])
+@app.route("/api/timetable/generate", methods=["POST"])
+@app.route("/api/timetable-generation", methods=["POST"])
+def generate_timetable():
+    """
+    Generate and optimize weekly class timetables with multi-teacher conflict resolution,
+    leave management, substitute teacher allocation, and curriculum distribution rules.
+    """
+    try:
+        raw_body = request.get_json()
+        if not raw_body or not isinstance(raw_body, dict):
+            return jsonify({
+                "status": "error",
+                "message": "Request body must be a valid JSON object."
+            }), 400
+
+        payload = raw_body.get("data") if ("data" in raw_body and isinstance(raw_body["data"], dict)) else raw_body
+
+        response_data, status_code = generate_timetable_ai(
+            payload=payload,
+            client=client,
+            default_model=DEFAULT_MODEL
+        )
+        return jsonify(response_data), status_code
+
+    except OpenAIError as oe:
+        logger.error(f"OpenAI API Error in timetable generation: {str(oe)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "status_code": 502,
+            "message": "OpenAI API Error",
+            "details": str(oe)
+        }), 502
+    except Exception as e:
+        logger.error(f"Internal Server Error in timetable generation: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "status_code": 500,
+            "message": "Internal Server Error",
+            "details": str(e)
+        }), 500
 
 
 if __name__ == "__main__":

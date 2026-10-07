@@ -119,3 +119,99 @@ docker logs -f edusoft_question_generator
   "suggestions": "Include numerical problems with step markings"
 }
 ```
+
+---
+
+### 3. Generate Timetable Schedule
+- **URL:** `/api/generate-timetable` (or `/generate-timetable`, `/api/timetable/generate`)
+- **Method:** `POST`
+- **Headers:** `Content-Type: application/json`
+
+#### Request Payload
+```json
+{
+  "class_id": 2,
+  "section_id": 1,
+  "week_dates": [
+    "12/10/2026",
+    "13/10/2026",
+    "14/10/2026",
+    "15/10/2026",
+    "16/10/2026",
+    "17/10/2026"
+  ],
+  "period_keys": [
+    "eight_to_nine",
+    "nine_to_ten",
+    "ten_to_eleven",
+    "eleven_to_twelve",
+    "twelve_to_one",
+    "two_to_three",
+    "three_to_four",
+    "four_to_five"
+  ],
+  "subject_teachers": [
+    {
+      "subject_id": 12,
+      "name": "Medical Surgical Nursing",
+      "teacher_id": 14,
+      "teacher_name": "Dr. Anjali Sharma",
+      "type": "Theory"
+    },
+    {
+      "subject_id": 15,
+      "name": "Pharmacology",
+      "teacher_id": 22,
+      "teacher_name": "Prof. Rajesh Kumar",
+      "type": "Theory"
+    }
+  ],
+  "unavailable_map": {
+    "12/10/2026": {
+      "14": "Dr. Anjali Sharma (Medical Leave)"
+    },
+    "13/10/2026": {
+      "14": "Dr. Anjali Sharma (Medical Leave)"
+    }
+  },
+  "teacher_busy_slots": {
+    "12/10/2026": {
+      "eight_to_nine": {
+        "9": true
+      }
+    }
+  },
+  "user_prompt": "Substitute Dr. Anjali with same-subject faculty on Monday and Tuesday."
+}
+```
+
+#### Response Payload
+```json
+{
+  "status": "success",
+  "message": "Weekly schedule optimized successfully with 0 teacher conflicts.",
+  "schedule": {
+    "12/10/2026": {
+      "eight_to_nine": {
+        "subject_id": 12,
+        "subject_name": "Medical Surgical Nursing",
+        "teacher_id": 22,
+        "teacher_name": "Prof. Rajesh Kumar",
+        "activity": "Theory Class",
+        "is_substituted": true,
+        "note": "Auto-substituted by AI: Same Subject Specialist (EMP-104)"
+      },
+      "nine_to_ten": {
+        "subject_id": 15,
+        "subject_name": "Pharmacology",
+        "teacher_id": 22,
+        "teacher_name": "Prof. Rajesh Kumar",
+        "activity": "Theory Class",
+        "is_substituted": false,
+        "note": ""
+      }
+    }
+  }
+}
+```
+
