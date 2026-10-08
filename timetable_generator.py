@@ -54,6 +54,90 @@ def normalize_list_or_json(val: Any) -> List[Any]:
     return []
 
 
+def extract_dates_map(val: Any) -> Dict[str, str]:
+    """
+    Extract a normalized mapping of date -> description from arbitrary list/dict/string inputs.
+    Safely handles list of dicts, dict maps, list of date strings, or JSON strings.
+    """
+    if not val:
+        return {}
+
+    if isinstance(val, str):
+        str_val = val.strip()
+        if (str_val.startswith("[") and str_val.endswith("]")) or (str_val.startswith("{") and str_val.endswith("}")):
+            try:
+                val = json.loads(str_val)
+            except Exception:
+                pass
+        elif "," in str_val:
+            val = [x.strip() for x in str_val.split(",") if x.strip()]
+        elif str_val:
+            val = [str_val]
+
+    result: Dict[str, str] = {}
+
+    if isinstance(val, dict):
+        for wrap_key in ("data", "list", "items", "records", "dates"):
+            if wrap_key in val and isinstance(val[wrap_key], (list, dict)):
+                val = val[wrap_key]
+                break
+
+    if isinstance(val, dict):
+        for k, v in val.items():
+            k_str = str(k).strip()
+            if isinstance(v, dict):
+                desc = (
+                    v.get("name")
+                    or v.get("title")
+                    or v.get("description")
+                    or v.get("reason")
+                    or v.get("activity")
+                    or v.get("event")
+                    or "Scheduled Event"
+                )
+                d_str = v.get("date") or v.get("activity_date") or v.get("holiday_date") or k_str
+                result[str(d_str).strip()] = str(desc).strip()
+            elif isinstance(v, str) and v.strip():
+                result[k_str] = v.strip()
+            else:
+                result[k_str] = "Scheduled Event"
+
+    elif isinstance(val, (list, tuple)):
+        for item in val:
+            if isinstance(item, dict):
+                d_str = (
+                    item.get("date")
+                    or item.get("activity_date")
+                    or item.get("holiday_date")
+                    or item.get("event_date")
+                    or item.get("id")
+                )
+                desc = (
+                    item.get("name")
+                    or item.get("title")
+                    or item.get("description")
+                    or item.get("reason")
+                    or item.get("activity")
+                    or item.get("event")
+                    or "Scheduled Event"
+                )
+                if d_str:
+                    result[str(d_str).strip()] = str(desc).strip()
+            elif isinstance(item, (str, int)):
+                d_str = str(item).strip()
+                if d_str:
+                    result[d_str] = "Scheduled Event"
+
+    return result
+
+
+def extract_dates_list(val: Any) -> List[str]:
+    """Extract a clean list of date strings (YYYY-MM-DD) from list/dict/string of dates or objects."""
+    d_map = extract_dates_map(val)
+    return list(d_map.keys())
+
+
+
 def extract_single_subject(item: Any, idx: int = 1) -> Optional[Dict[str, Any]]:
     """Extract a normalized subject dictionary from arbitrary item structure."""
     if not item:
@@ -578,8 +662,11 @@ def generate_deterministic_schedule(
     if total_subjects == 0:
         return {}
 
-    holidays_set = set(holiday_dates or [])
-    activities_set = set(activity_dates or [])
+    holidays_map = extract_dates_map(holiday_dates)
+    activities_map = extract_dates_map(activity_dates)
+
+    holidays_set = set(holidays_map.keys())
+    activities_set = set(activities_map.keys())
 
     subject_idx = 0
 
@@ -588,29 +675,31 @@ def generate_deterministic_schedule(
         
         # Check if full day holiday
         if date_str in holidays_set:
+            h_name = holidays_map.get(date_str) or "Holiday / Off Day"
             for period_key in period_keys:
                 schedule[date_str][period_key] = {
                     "subject_id": 0,
-                    "subject_name": "Holiday / Off Day",
+                    "subject_name": h_name if h_name != "Scheduled Event" else "Holiday / Off Day",
                     "teacher_id": 0,
                     "teacher_name": "N/A",
                     "activity": "Holiday",
                     "is_substituted": False,
-                    "note": "Scheduled College Holiday"
+                    "note": f"Scheduled College Holiday: {h_name}" if h_name != "Scheduled Event" else "Scheduled College Holiday"
                 }
             continue
 
         # Check if full day college activity
         if date_str in activities_set:
+            act_name = activities_map.get(date_str) or "Institutional Activity / Event"
             for period_key in period_keys:
                 schedule[date_str][period_key] = {
                     "subject_id": 0,
-                    "subject_name": "Institutional Activity / Event",
+                    "subject_name": act_name if act_name != "Scheduled Event" else "Institutional Activity / Event",
                     "teacher_id": 0,
                     "teacher_name": "N/A",
                     "activity": "College Activity",
                     "is_substituted": False,
-                    "note": "Scheduled Institutional Event"
+                    "note": f"Scheduled Institutional Event: {act_name}" if act_name != "Scheduled Event" else "Scheduled Institutional Event"
                 }
             continue
 
@@ -702,8 +791,11 @@ def validate_and_hydrate_schedule(
         activity_dates=activity_dates
     )
 
-    holidays_set = set(holiday_dates or [])
-    activities_set = set(activity_dates or [])
+    holidays_map = extract_dates_map(holiday_dates)
+    activities_map = extract_dates_map(activity_dates)
+
+    holidays_set = set(holidays_map.keys())
+    activities_set = set(activities_map.keys())
     final_schedule: Dict[str, Dict[str, Any]] = {}
 
     for date_str in week_dates:
@@ -852,10 +944,10 @@ def generate_timetable_ai(
     teacher_busy_slots = normalize_dict_or_json(
         payload.get("teacher_busy_slots") or payload.get("busy_slots") or payload.get("busy_teachers")
     )
-    holiday_dates = normalize_list_or_json(
+    holiday_dates = extract_dates_list(
         payload.get("holiday_dates") or payload.get("holidays") or payload.get("holiday_list")
     )
-    activity_dates = normalize_list_or_json(
+    activity_dates = extract_dates_list(
         payload.get("activity_dates") or payload.get("activities") or payload.get("events")
     )
     user_prompt = str(payload.get("user_prompt") or payload.get("prompt") or "").strip()
