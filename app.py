@@ -1611,14 +1611,55 @@ def generate_timetable():
     leave management, substitute teacher allocation, and curriculum distribution rules.
     """
     try:
-        raw_body = request.get_json()
+        raw_body = request.get_json(silent=True, force=True)
+        if raw_body is None:
+            if request.data:
+                try:
+                    raw_body = json.loads(request.data.decode("utf-8"))
+                except Exception:
+                    pass
+            if raw_body is None and request.form:
+                form_val = request.form.get("data") or request.form.get("payload") or request.form.get("body")
+                if form_val:
+                    try:
+                        raw_body = json.loads(form_val)
+                    except Exception:
+                        pass
+                else:
+                    raw_body = dict(request.form)
+
+        if isinstance(raw_body, str):
+            try:
+                raw_body = json.loads(raw_body)
+            except Exception:
+                pass
+
         if not raw_body or not isinstance(raw_body, dict):
+            preview = request.get_data(as_text=True)[:200]
+            logger.warning(
+                f"[TIMETABLE BAD REQUEST] Invalid request body. Content-Type: {request.content_type}, Body Preview: {preview}"
+            )
             return jsonify({
                 "status": "error",
-                "message": "Request body must be a valid JSON object."
+                "message": "Request body must be a valid JSON object or contain valid timetable data."
             }), 400
 
-        payload = raw_body.get("data") if ("data" in raw_body and isinstance(raw_body["data"], dict)) else raw_body
+        payload = raw_body
+        if "data" in raw_body and isinstance(raw_body["data"], (dict, str)):
+            payload = raw_body["data"]
+        elif "payload" in raw_body and isinstance(raw_body["payload"], (dict, str)):
+            payload = raw_body["payload"]
+        elif "timetable" in raw_body and isinstance(raw_body["timetable"], (dict, str)):
+            payload = raw_body["timetable"]
+
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                pass
+
+        if not isinstance(payload, dict):
+            payload = raw_body
 
         response_data, status_code = generate_timetable_ai(
             payload=payload,
@@ -1626,6 +1667,7 @@ def generate_timetable():
             default_model=DEFAULT_MODEL
         )
         return jsonify(response_data), status_code
+
 
     except OpenAIError as oe:
         logger.error(f"OpenAI API Error in timetable generation: {str(oe)}", exc_info=True)

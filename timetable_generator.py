@@ -7,6 +7,7 @@ Ultra-fast token-compact AI generation with deterministic hydration and zero-lag
 import os
 import json
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Set
 from openai import OpenAI, OpenAIError
 
@@ -15,6 +16,212 @@ logger = logging.getLogger("edusoft_service.timetable_generator")
 # Maximum seconds to wait for OpenAI before triggering fast deterministic scheduler fallback
 OPENAI_TIMETABLE_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMETABLE_TIMEOUT_SECONDS", "45.0"))
 OPENAI_TIMETABLE_MAX_RETRIES = int(os.getenv("OPENAI_TIMETABLE_MAX_RETRIES", "2"))
+
+
+def normalize_dict_or_json(val: Any) -> Dict[str, Any]:
+    """Normalize input into a dictionary whether passed as dict or JSON string."""
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            parsed = json.loads(val.strip())
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def normalize_list_or_json(val: Any) -> List[Any]:
+    """Normalize input into a list whether passed as list, dict, CSV string, or JSON string."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, dict):
+        return list(val.values())
+    if isinstance(val, str) and val.strip():
+        str_val = val.strip()
+        try:
+            parsed = json.loads(str_val)
+            if isinstance(parsed, list):
+                return parsed
+            elif isinstance(parsed, dict):
+                return list(parsed.values())
+        except Exception:
+            pass
+        if "," in str_val:
+            return [x.strip() for x in str_val.split(",") if x.strip()]
+        return [str_val]
+    return []
+
+
+def normalize_dates(raw_dates: Any, payload: Dict[str, Any]) -> List[str]:
+    """Extract and normalize list of ISO dates (YYYY-MM-DD) from various input formats."""
+    # 1. Direct parsing if string/json
+    if isinstance(raw_dates, str):
+        raw_str = raw_dates.strip()
+        if (raw_str.startswith("[") and raw_str.endswith("]")) or (raw_str.startswith("{") and raw_str.endswith("}")):
+            try:
+                raw_dates = json.loads(raw_str)
+            except Exception:
+                pass
+        elif "," in raw_str:
+            raw_dates = [d.strip() for d in raw_str.split(",") if d.strip()]
+        elif raw_str:
+            raw_dates = [raw_str]
+
+    if isinstance(raw_dates, dict):
+        raw_dates = list(raw_dates.values())
+
+    if isinstance(raw_dates, list) and len(raw_dates) > 0:
+        return [str(d).strip() for d in raw_dates if str(d).strip()]
+
+    # 2. Derive from start_date / end_date / num_days
+    start_date_str = str(
+        payload.get("start_date") or payload.get("from_date") or payload.get("start") or ""
+    ).strip()
+    end_date_str = str(
+        payload.get("end_date") or payload.get("to_date") or payload.get("end") or ""
+    ).strip()
+    num_days = payload.get("num_days") or payload.get("days_count") or payload.get("total_days") or 6
+
+    if start_date_str:
+        start_dt = None
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+            try:
+                start_dt = datetime.strptime(start_date_str, fmt)
+                break
+            except ValueError:
+                pass
+
+        if start_dt:
+            end_dt = None
+            if end_date_str:
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                    try:
+                        end_dt = datetime.strptime(end_date_str, fmt)
+                        break
+                    except ValueError:
+                        pass
+            else:
+                try:
+                    count = int(num_days)
+                except Exception:
+                    count = 6
+                end_dt = start_dt + timedelta(days=max(count - 1, 0))
+
+            if end_dt and end_dt >= start_dt:
+                date_list = []
+                cur = start_dt
+                while cur <= end_dt:
+                    date_list.append(cur.strftime("%Y-%m-%d"))
+                    cur += timedelta(days=1)
+                return date_list
+
+    return []
+
+
+def normalize_periods(raw_periods: Any, payload: Dict[str, Any]) -> List[str]:
+    """Extract and normalize period slots into a list of strings."""
+    # 1. Integer count (e.g., 6 -> ["1", "2", "3", "4", "5", "6"])
+    if isinstance(raw_periods, int):
+        return [str(i) for i in range(1, raw_periods + 1)]
+
+    # 2. String representation
+    if isinstance(raw_periods, str):
+        raw_str = raw_periods.strip()
+        if raw_str.isdigit():
+            return [str(i) for i in range(1, int(raw_str) + 1)]
+        if (raw_str.startswith("[") and raw_str.endswith("]")) or (raw_str.startswith("{") and raw_str.endswith("}")):
+            try:
+                parsed = json.loads(raw_str)
+                if isinstance(parsed, list):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+                elif isinstance(parsed, dict):
+                    return [str(k).strip() for k in parsed.keys() if str(k).strip()]
+                elif isinstance(parsed, int):
+                    return [str(i) for i in range(1, parsed + 1)]
+            except Exception:
+                pass
+        if "," in raw_str:
+            return [p.strip() for p in raw_str.split(",") if p.strip()]
+        if raw_str:
+            return [raw_str]
+
+    # 3. Dict representation
+    if isinstance(raw_periods, dict):
+        return [str(k).strip() for k in raw_periods.keys() if str(k).strip()]
+
+    # 4. List representation
+    if isinstance(raw_periods, list) and len(raw_periods) > 0:
+        return [str(p).strip() for p in raw_periods if str(p).strip()]
+
+    # 5. Alternative period count keys
+    for alt_key in ("total_periods", "periods_per_day", "num_periods", "slots_per_day", "period_count", "periods_count"):
+        val = payload.get(alt_key)
+        if val is not None:
+            try:
+                cnt = int(val)
+                if cnt > 0:
+                    return [str(i) for i in range(1, cnt + 1)]
+            except (ValueError, TypeError):
+                pass
+
+    return []
+
+
+def normalize_subject_teachers(raw_subjects: Any, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract and normalize subject-teacher mappings into a list of dicts."""
+    # 1. JSON String
+    if isinstance(raw_subjects, str):
+        raw_str = raw_subjects.strip()
+        if (raw_str.startswith("[") and raw_str.endswith("]")) or (raw_str.startswith("{") and raw_str.endswith("}")):
+            try:
+                raw_subjects = json.loads(raw_str)
+            except Exception:
+                pass
+
+    # 2. Dict format
+    if isinstance(raw_subjects, dict):
+        raw_subjects = list(raw_subjects.values())
+
+    # 3. List format
+    if isinstance(raw_subjects, list) and len(raw_subjects) > 0:
+        result = []
+        for item in raw_subjects:
+            if isinstance(item, dict):
+                result.append(item)
+            elif isinstance(item, (str, int)):
+                result.append({
+                    "subject_id": item,
+                    "name": str(item),
+                    "teacher_id": ""
+                })
+        if result:
+            return result
+
+    # 4. Alternative keys
+    for alt_key in ("subjects", "subject_list", "subject_teachers", "teacher_subjects", "subject_mapping"):
+        val = payload.get(alt_key)
+        if val is not None:
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    pass
+            if isinstance(val, dict):
+                val = list(val.values())
+            if isinstance(val, list) and len(val) > 0:
+                result = []
+                for item in val:
+                    if isinstance(item, dict):
+                        result.append(item)
+                    elif isinstance(item, (str, int)):
+                        result.append({"subject_id": item, "name": str(item), "teacher_id": ""})
+                if result:
+                    return result
+
+    return []
+
 
 
 
@@ -415,34 +622,63 @@ def generate_timetable_ai(
     hydration and deterministic fallback.
     """
     # 1. Parse & normalize inputs
-    week_dates = payload.get("week_dates") or payload.get("dates") or []
-    if not isinstance(week_dates, list) or len(week_dates) == 0:
+    week_dates = normalize_dates(
+        payload.get("week_dates") or payload.get("dates") or payload.get("date_list") or payload.get("days"),
+        payload
+    )
+    if not week_dates:
+        logger.warning(
+            "[TIMETABLE VALIDATION ERROR] Missing or empty 'week_dates'. Payload keys: %s",
+            list(payload.keys()) if isinstance(payload, dict) else type(payload)
+        )
         return {
             "status": "error",
-            "message": "Field 'week_dates' is required and must be a non-empty list of dates."
+            "message": "Field 'week_dates' (or 'dates' / 'start_date') is required and must contain at least one date."
         }, 400
 
-    period_keys = payload.get("period_keys") or payload.get("periods") or []
-    if not isinstance(period_keys, list) or len(period_keys) == 0:
+    period_keys = normalize_periods(
+        payload.get("period_keys") or payload.get("periods") or payload.get("slots") or payload.get("period_list"),
+        payload
+    )
+    if not period_keys:
+        logger.warning(
+            "[TIMETABLE VALIDATION ERROR] Missing or empty 'period_keys'. Payload keys: %s",
+            list(payload.keys()) if isinstance(payload, dict) else type(payload)
+        )
         return {
             "status": "error",
-            "message": "Field 'period_keys' is required and must be a non-empty list of period slots."
+            "message": "Field 'period_keys' (or 'periods' / 'periods_per_day') is required and must contain valid period slots."
         }, 400
 
-    subject_teachers = payload.get("subject_teachers") or payload.get("subjects") or []
-    if not isinstance(subject_teachers, list) or len(subject_teachers) == 0:
+    subject_teachers = normalize_subject_teachers(
+        payload.get("subject_teachers") or payload.get("subjects") or payload.get("subject_list") or payload.get("teacher_subjects"),
+        payload
+    )
+    if not subject_teachers:
+        logger.warning(
+            "[TIMETABLE VALIDATION ERROR] Missing or empty 'subject_teachers'. Payload keys: %s",
+            list(payload.keys()) if isinstance(payload, dict) else type(payload)
+        )
         return {
             "status": "error",
-            "message": "Field 'subject_teachers' is required and must be a non-empty list of subject-teacher mappings."
+            "message": "Field 'subject_teachers' (or 'subjects') is required and must contain a non-empty list of subjects."
         }, 400
 
-    class_id = payload.get("class_id")
-    section_id = payload.get("section_id")
-    
-    unavailable_map = payload.get("unavailable_map") if isinstance(payload.get("unavailable_map"), dict) else {}
-    teacher_busy_slots = payload.get("teacher_busy_slots") if isinstance(payload.get("teacher_busy_slots"), dict) else {}
-    holiday_dates = payload.get("holiday_dates") if isinstance(payload.get("holiday_dates"), list) else []
-    activity_dates = payload.get("activity_dates") if isinstance(payload.get("activity_dates"), list) else []
+    class_id = payload.get("class_id") or payload.get("classId")
+    section_id = payload.get("section_id") or payload.get("sectionId")
+
+    unavailable_map = normalize_dict_or_json(
+        payload.get("unavailable_map") or payload.get("leaves") or payload.get("teacher_leaves") or payload.get("leave_map")
+    )
+    teacher_busy_slots = normalize_dict_or_json(
+        payload.get("teacher_busy_slots") or payload.get("busy_slots") or payload.get("busy_teachers")
+    )
+    holiday_dates = normalize_list_or_json(
+        payload.get("holiday_dates") or payload.get("holidays") or payload.get("holiday_list")
+    )
+    activity_dates = normalize_list_or_json(
+        payload.get("activity_dates") or payload.get("activities") or payload.get("events")
+    )
     user_prompt = str(payload.get("user_prompt") or payload.get("prompt") or "").strip()
     model = payload.get("model") or default_model
 
@@ -481,13 +717,15 @@ Rules:
 
     condensed_subjects = []
     for st in subject_teachers:
-        s_id = st.get("subject_id") or st.get("id")
-        t_id = st.get("teacher_id")
+        s_id = st.get("subject_id") or st.get("id") or st.get("subjectId")
+        t_id = st.get("teacher_id") or st.get("faculty_id") or st.get("teacherId") or st.get("facultyId") or ""
+        s_name = st.get("name") or st.get("subject_name") or st.get("subjectName") or f"Subject {s_id}"
         condensed_subjects.append({
             "subject_id": s_id,
-            "name": st.get("name") or st.get("subject_name"),
+            "name": s_name,
             "teacher_id": t_id
         })
+
 
     compact_payload = {
         "dates": week_dates,
