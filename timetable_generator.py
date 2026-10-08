@@ -4,6 +4,7 @@ Optimizes weekly class schedules with multi-teacher conflict resolution, leave m
 substitute teacher allocation, team-teaching handling, and curriculum distribution rules.
 Ultra-fast token-compact AI generation with deterministic hydration and zero-lag fallback.
 """
+import os
 import json
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Set
@@ -12,7 +13,9 @@ from openai import OpenAI, OpenAIError
 logger = logging.getLogger("edusoft_service.timetable_generator")
 
 # Maximum seconds to wait for OpenAI before triggering fast deterministic scheduler fallback
-OPENAI_TIMETABLE_TIMEOUT_SECONDS = 12.0
+OPENAI_TIMETABLE_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMETABLE_TIMEOUT_SECONDS", "45.0"))
+OPENAI_TIMETABLE_MAX_RETRIES = int(os.getenv("OPENAI_TIMETABLE_MAX_RETRIES", "2"))
+
 
 
 def normalize_id(val: Any) -> str:
@@ -496,9 +499,12 @@ Rules:
         "user_prompt": user_prompt
     }
 
+    request_timeout = float(payload.get("timeout") or OPENAI_TIMETABLE_TIMEOUT_SECONDS)
+    max_retries = int(payload.get("max_retries") if payload.get("max_retries") is not None else OPENAI_TIMETABLE_MAX_RETRIES)
+
     try:
-        # Request with 0 retries and clean 12s timeout
-        api_client = client.with_options(max_retries=0)
+        # Request with configurable retries and timeout
+        api_client = client.with_options(max_retries=max_retries)
         response = api_client.chat.completions.create(
             model=model,
             messages=[
@@ -507,7 +513,7 @@ Rules:
             ],
             response_format={"type": "json_object"},
             temperature=0.2,
-            timeout=OPENAI_TIMETABLE_TIMEOUT_SECONDS
+            timeout=request_timeout
         )
 
         content = response.choices[0].message.content
