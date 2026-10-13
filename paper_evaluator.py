@@ -186,18 +186,19 @@ FORBIDDEN_NAME_WORDS = {
 }
 
 
-def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
-    Search document text (from PDF or OCR) for student name and reg details.
-    Only returns a name if explicitly written on the document header.
+    Search document text (from PDF or OCR) for student name and student ID.
+    Only returns name/ID if explicitly written on the document header.
     """
     detected_name = None
+    detected_id = None
     detected_adm = None
     detected_roll = None
     detected_kuhs = None
 
     if not text:
-        return None, None, None, None
+        return None, None, None, None, None
 
     # Restrict to first 1500 characters (header/cover page)
     header_chunk = text[:1500]
@@ -208,14 +209,6 @@ def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optio
         header_chunk,
         re.IGNORECASE
     )
-    if not name_match:
-        # Also check for standalone Name: provided it is not Name of Exam / College / Subject etc.
-        name_match = re.search(
-            r"(?<![A-Za-z])Name\s*[:\-\. ]\s*(?!of\s+)(?!the\s+)([A-Za-z\s\.]{2,40})",
-            header_chunk,
-            re.IGNORECASE
-        )
-
     if name_match:
         cand = name_match.group(1).strip()
         lower_cand = cand.lower()
@@ -229,6 +222,15 @@ def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optio
         ):
             detected_name = cand
 
+    # Pattern for Student ID / Candidate ID / Reg ID
+    id_match = re.search(
+        r"(?:Student\s*ID|Candidate\s*ID|Student\s*Id|Candidate\s*Id|Student\s*No)\s*[:\-\. ]\s*([A-Za-z0-9\-_/]+)",
+        header_chunk,
+        re.IGNORECASE
+    )
+    if id_match:
+        detected_id = id_match.group(1).strip()
+
     adm_match = re.search(r"(?:Admission\s*No|Adm\s*No|Admission\s*Number)\s*[:\-\. ]\s*([A-Za-z0-9\-_/]+)", header_chunk, re.IGNORECASE)
     if adm_match:
         detected_adm = adm_match.group(1).strip()
@@ -241,7 +243,7 @@ def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optio
     if kuhs_match:
         detected_kuhs = kuhs_match.group(1).strip()
 
-    return detected_name, detected_adm, detected_roll, detected_kuhs
+    return detected_name, detected_id, detected_adm, detected_roll, detected_kuhs
 
 
 def extract_qa_pairs_from_text(text: str) -> List[Dict[str, Any]]:
@@ -363,11 +365,12 @@ def evaluate_student_submission_ai(
     Otherwise, do NOT show the name (student_name is empty and recognition_status is 'unmatched').
     Never use default or payload names if absent on the document.
     """
-    # Never use any default or passed student name from payload
+    # Never use any default or passed student name or student ID from payload
     student_data.pop("student_name", None)
     student_data.pop("name", None)
+    student_data.pop("student_id", None)
+    student_data.pop("id", None)
 
-    student_id = student_data.get("student_id") or student_data.get("id") or 1
     max_marks = float(exam_context.get("max_marks", 100.0))
     subject_title = exam_context.get("subject_name") or exam_context.get("title") or "Curriculum Assessment"
     answer_key_content = exam_context.get("answer_key_content") or ""
@@ -420,17 +423,19 @@ def evaluate_student_submission_ai(
     combined_document_text = (extracted_pdf_text + "\n" + direct_response_text).strip()
 
     # 3. Check for student identity written directly on the document text
-    text_detected_name, text_detected_adm, text_detected_roll, text_detected_kuhs = extract_identity_from_document_text(combined_document_text)
+    text_detected_name, text_detected_id, text_detected_adm, text_detected_roll, text_detected_kuhs = extract_identity_from_document_text(combined_document_text)
 
-    # Default identity state: UNMATCHED / NO NAME
+    # Default identity state: UNMATCHED / NO NAME / NO ID
     detected_student_name: Optional[str] = text_detected_name
+    detected_student_id: Optional[str] = text_detected_id
     admission_no: str = text_detected_adm or ""
     roll_no: str = text_detected_roll or ""
     kuhs_reg_no: str = text_detected_kuhs or ""
     student_image: str = ""
     has_name: bool = bool(detected_student_name)
-    recognition_status = "matched" if has_name else "unmatched"
-    recognition_confidence = 98.5 if has_name else 0.0
+    has_id: bool = bool(detected_student_id)
+    recognition_status = "matched" if (has_name or has_id) else "unmatched"
+    recognition_confidence = 98.5 if (has_name or has_id) else 0.0
 
     # Questions from exam context or payload
     questions = exam_context.get("questions") or student_data.get("questions") or []
@@ -453,10 +458,11 @@ def evaluate_student_submission_ai(
                 "Your objective is to evaluate the student's uploaded answer paper (PDF text or scanned images) "
                 "against the question paper and model answer key.\n\n"
                 "STRICT IDENTITY EXTRACTION RULES:\n"
-                "1. Inspect the uploaded document/image carefully for the student's name written on the paper (check cover page or top header).\n"
-                "2. ONLY if a real student name is visibly written/printed ON THE PAPER, extract it into 'detected_student_name' and set 'recognition_status': 'matched' and 'recognition_confidence': 98.5.\n"
-                "3. If NO student name is visibly written/printed on the uploaded paper, you MUST return null for 'detected_student_name', set 'recognition_status': 'unmatched', and 'recognition_confidence': 0.0.\n"
-                "4. Under NO circumstances invent, guess, or use any fictional student name, and NEVER infer a name from the subject, course, or filenames.\n\n"
+                "1. Inspect the uploaded document/image carefully for the student's name and student ID written on the paper (check cover page or top header).\n"
+                "2. ONLY if a real student name is visibly written/printed ON THE PAPER, extract it into 'detected_student_name'. If NO student name is on the paper, return null.\n"
+                "3. ONLY if a student ID (or candidate ID / roll no) is visibly written/printed ON THE PAPER, extract it into 'detected_student_id'. If NO student ID is on the paper, return null.\n"
+                "4. If NO student name and NO student ID are written on the paper, return null for both, set 'recognition_status': 'unmatched', and 'recognition_confidence': 0.0.\n"
+                "5. Under NO circumstances invent, guess, or use any fictional or default names or IDs.\n\n"
                 "QUESTION & ANSWER EXTRACTION RULES:\n"
                 "1. Detect the questions answered by the student on the uploaded paper.\n"
                 "2. For each question:\n"
@@ -465,7 +471,7 @@ def evaluate_student_submission_ai(
                 "   - Compare against the answer key and provide step markings (step, max_marks, obtained_marks, status).\n"
                 "   - Provide concise diagnostic feedback.\n"
                 "3. Compute total obtained marks as the sum of marks obtained across all questions.\n"
-                "4. Provide 'ai_feedback' (referring to the student as 'The student' if no name was detected).\n"
+                "4. Provide 'ai_feedback' (without using any student name if none was detected on the paper).\n"
                 "5. Provide 'ai_insights' with 'recommendation', 'focus_areas', and 'strengths'.\n"
                 "Output strictly valid JSON matching the required schema."
             )
@@ -485,6 +491,7 @@ EXTRACTED TEXT FROM UPLOADED DOCUMENT:
 Return a single JSON object with this EXACT schema:
 {{
   "detected_student_name": null,
+  "detected_student_id": null,
   "detected_admission_no": null,
   "detected_roll_no": null,
   "detected_kuhs_reg_no": null,
@@ -572,18 +579,34 @@ Return a single JSON object with this EXACT schema:
                         has_name = True
 
                     if has_name:
-                        recognition_status = "matched"
-                        recognition_confidence = float(parsed.get("recognition_confidence") or 98.5)
                         admission_no = str(parsed.get("detected_admission_no") or admission_no).strip()
                         roll_no = str(parsed.get("detected_roll_no") or roll_no).strip()
                         kuhs_reg_no = str(parsed.get("detected_kuhs_reg_no") or kuhs_reg_no).strip()
                 elif not text_detected_name:
                     has_name = False
                     detected_student_name = None
+
+                # Check if OpenAI detected a student ID on the paper
+                ai_det_id = parsed.get("detected_student_id")
+                if (
+                    ai_det_id
+                    and str(ai_det_id).strip()
+                    and str(ai_det_id).strip().lower() not in ("null", "none", "n/a", "student", "unknown", "false", "undefined", "unmatched")
+                ):
+                    detected_student_id = str(ai_det_id).strip()
+                    has_id = True
+                elif not text_detected_id:
+                    has_id = False
+                    detected_student_id = None
+
+                if has_name or has_id:
+                    recognition_status = "matched"
+                    recognition_confidence = float(parsed.get("recognition_confidence") or 98.5)
+                else:
                     recognition_status = "unmatched"
                     recognition_confidence = 0.0
 
-                logger.info(f"OpenAI evaluation completed successfully (Name Detected on Document: {has_name})")
+                logger.info(f"OpenAI evaluation completed successfully (Name Detected: {has_name}, ID Detected: {has_id})")
         except Exception as e:
             logger.warning(f"OpenAI evaluation failed ({str(e)}). Using dynamic algorithmic evaluation.")
 
@@ -782,17 +805,24 @@ Return a single JSON object with this EXACT schema:
     grade_val = student_data.get("grade") or calculate_grade(percentage_val)
     status_val = student_data.get("status") or determine_status(percentage_val)
 
-    # STRICT CHECK: Only display student name and personal details if detected on the document itself
-    final_student_name = detected_student_name if has_name else ""
-    final_adm = admission_no if has_name else ""
-    final_roll = roll_no if has_name else ""
-    final_kuhs = kuhs_reg_no if has_name else ""
-    final_img = student_image if has_name else ""
+    # STRICT CHECK: Only pass student_name and student_id if detected on the document itself
+    final_student_name = detected_student_name if (has_name and detected_student_name) else ""
 
-    logger.info(f"Evaluation finished for sheet: Name detected={final_student_name if has_name else 'None'}, Status={recognition_status}, Marks={obtained_val}/{max_marks}")
+    if has_id and detected_student_id and str(detected_student_id).strip():
+        det_id_str = str(detected_student_id).strip()
+        final_student_id = int(det_id_str) if det_id_str.isdigit() else det_id_str
+    else:
+        final_student_id = ""
+
+    final_adm = admission_no if (has_name or has_id) else ""
+    final_roll = roll_no if (has_name or has_id) else ""
+    final_kuhs = kuhs_reg_no if (has_name or has_id) else ""
+    final_img = student_image if (has_name or has_id) else ""
+
+    logger.info(f"Evaluation finished for sheet: Name detected={final_student_name or 'None'}, ID detected={final_student_id or 'None'}, Status={recognition_status}, Marks={obtained_val}/{max_marks}")
 
     return {
-        "student_id": int(student_id) if (student_id is not None and str(student_id).isdigit()) else student_id,
+        "student_id": final_student_id,
         "student_name": final_student_name,
         "admission_no": final_adm,
         "roll_no": final_roll,
