@@ -1718,12 +1718,24 @@ def evaluate_papers():
                     try:
                         raw_body = json.loads(form_val)
                     except Exception:
-                        pass
+                        raw_body = dict(request.form)
                 else:
                     raw_body = dict(request.form)
 
+        if raw_body is None:
+            raw_body = {}
+
+        if isinstance(raw_body, dict):
+            for k in ["students", "questions", "answer_key", "data", "payload"]:
+                if k in raw_body and isinstance(raw_body[k], str):
+                    try:
+                        raw_body[k] = json.loads(raw_body[k])
+                    except Exception:
+                        pass
+
         # Support multipart file upload if files/images/PDFs attached
         uploaded_student_files = []
+        uploaded_answer_key = None
         if request.files:
             upload_dir = os.path.join(tempfile.gettempdir(), "evaluation_uploads")
             os.makedirs(upload_dir, exist_ok=True)
@@ -1733,30 +1745,47 @@ def evaluate_papers():
                         safe_filename = file_obj.filename
                         save_path = os.path.join(upload_dir, safe_filename)
                         file_obj.save(save_path)
-                        uploaded_student_files.append({
-                            "file_name": safe_filename,
-                            "file_path": save_path,
-                            "file_type": "pdf" if safe_filename.lower().endswith(".pdf") else "jpg"
-                        })
+                        is_key = any(k in key.lower() or k in safe_filename.lower() for k in ["answer_key", "model_answer", "key"])
+                        if is_key:
+                            uploaded_answer_key = save_path
+                        else:
+                            uploaded_student_files.append({
+                                "file_name": safe_filename,
+                                "file_path": save_path,
+                                "file_type": "pdf" if safe_filename.lower().endswith(".pdf") else "jpg"
+                            })
 
-        if raw_body is None and uploaded_student_files:
-            raw_body = {}
+        payload = raw_body
+        if "data" in raw_body and isinstance(raw_body["data"], dict):
+            payload = {**raw_body, **raw_body["data"]}
+        elif "payload" in raw_body and isinstance(raw_body["payload"], dict):
+            payload = {**raw_body, **raw_body["payload"]}
 
-        if not raw_body or not isinstance(raw_body, dict):
+        if uploaded_answer_key and not payload.get("answer_key_file"):
+            payload["answer_key_file"] = uploaded_answer_key
+
+        if uploaded_student_files:
+            if not payload.get("students"):
+                payload["students"] = uploaded_student_files
+            else:
+                for idx, s in enumerate(payload["students"]):
+                    if isinstance(s, dict) and not s.get("file_path") and idx < len(uploaded_student_files):
+                        s["file_path"] = uploaded_student_files[idx]["file_path"]
+                        s["file_name"] = uploaded_student_files[idx]["file_name"]
+                        s["file_type"] = uploaded_student_files[idx]["file_type"]
+        elif not payload.get("students") and (payload.get("file_path") or payload.get("file_name")):
+            payload["students"] = [{
+                "file_path": payload.get("file_path"),
+                "file_name": payload.get("file_name", os.path.basename(payload.get("file_path", ""))),
+                "file_type": "pdf" if str(payload.get("file_path", "")).lower().endswith(".pdf") else "jpg",
+                "page_count": payload.get("page_count", 1)
+            }]
+
+        if not payload or not isinstance(payload, dict):
             return jsonify({
                 "status": "error",
                 "message": "Request body must be a valid JSON object or contain uploaded answer sheet files."
             }), 400
-
-        payload = raw_body
-        if "data" in raw_body and isinstance(raw_body["data"], dict):
-            payload = raw_body["data"]
-        elif "payload" in raw_body and isinstance(raw_body["payload"], dict):
-            payload = raw_body["payload"]
-
-        # Merge uploaded files if students array not supplied
-        if uploaded_student_files and not payload.get("students"):
-            payload["students"] = uploaded_student_files
 
         response_data, status_code = process_paper_evaluation(
             payload=payload,
