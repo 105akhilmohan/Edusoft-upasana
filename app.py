@@ -1808,6 +1808,14 @@ def evaluate_papers():
                 "page_count": payload.get("page_count", 1)
             }]
 
+        if "students" in payload and isinstance(payload["students"], list):
+            for s in payload["students"]:
+                if isinstance(s, dict) and "pages_json" in s and isinstance(s["pages_json"], str) and not s.get("pages"):
+                    try:
+                        s["pages"] = json.loads(s["pages_json"])
+                    except Exception:
+                        pass
+
         # Disregard any incoming student identity sent by PHP backend; only retrieve identity written in PDF/image
         IDENTITY_FIELDS = [
             "student_name", "student_id", "name", "id", "admission_no", "adm_no",

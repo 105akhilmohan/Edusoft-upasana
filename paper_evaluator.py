@@ -98,6 +98,11 @@ def resolve_file_location(path_or_url: str) -> Optional[str]:
     if os.path.exists(p) and os.path.isfile(p):
         return os.path.abspath(p)
 
+    import urllib.parse
+    p_unquoted = urllib.parse.unquote(p)
+    if os.path.exists(p_unquoted) and os.path.isfile(p_unquoted):
+        return os.path.abspath(p_unquoted)
+
     # 2. Remote URL handling (e.g., http://.../uploads/...)
     if p.startswith("http://") or p.startswith("https://"):
         try:
@@ -125,45 +130,76 @@ def resolve_file_location(path_or_url: str) -> Optional[str]:
     # 4. Search across standard server directories
     cwd = os.getcwd()
     filename_only = os.path.basename(p)
+    filename_unquoted = os.path.basename(p_unquoted)
+    norm_p = p.replace("/", os.sep).replace("\\", os.sep)
+    norm_unquoted = p_unquoted.replace("/", os.sep).replace("\\", os.sep)
+
     candidates = [
         os.path.join(cwd, p),
+        os.path.join(cwd, norm_p),
+        os.path.join(cwd, norm_unquoted),
         os.path.join("/app", p),
         os.path.join("/var/www/html", p),
         os.path.join("/var/www/html/edusoft", p),
         os.path.join("/var/www", p),
         os.path.join(os.path.dirname(cwd), p),
         os.path.join(cwd, "uploads", filename_only),
+        os.path.join(cwd, "uploads", filename_unquoted),
         os.path.join(cwd, "uploads", "evaluation_papers", filename_only),
+        os.path.join(cwd, "uploads", "evaluation_papers", filename_unquoted),
         os.path.join("/app", "uploads", filename_only),
         os.path.join("/app", "uploads", "evaluation_papers", filename_only),
         os.path.join("/var/www/html", "uploads", "evaluation_papers", filename_only),
+        os.path.join(r"C:\wamp64\www\edusoft", norm_p),
+        os.path.join(r"C:\wamp64\www", norm_p),
+        os.path.join(r"C:\xampp\htdocs\edusoft", norm_p),
+        os.path.join(r"C:\xampp\htdocs", norm_p),
+        os.path.join(r"C:\wamp64\www\uploads\evaluation_papers", filename_only),
+        os.path.join(r"C:\wamp64\www\edusoft\uploads\evaluation_papers", filename_only),
+        os.path.join(r"C:\xampp\htdocs\uploads\evaluation_papers", filename_only),
+        os.path.join(r"C:\xampp\htdocs\edusoft\uploads\evaluation_papers", filename_only),
         os.path.join(tempfile.gettempdir(), "evaluation_uploads", filename_only),
         os.path.join(tempfile.gettempdir(), filename_only),
     ]
     for c in candidates:
-        if os.path.exists(c) and os.path.isfile(c):
-            return os.path.abspath(c)
+        try:
+            if os.path.exists(c) and os.path.isfile(c):
+                return os.path.abspath(c)
+        except Exception:
+            pass
 
     # 5. Recursive search in known upload directories
     for root_dir in [
         "/app/uploads",
         os.path.join(cwd, "uploads"),
         "/var/www/html/uploads",
+        r"C:\wamp64\www\uploads",
+        r"C:\xampp\htdocs\uploads",
         os.path.join(tempfile.gettempdir(), "evaluation_uploads")
     ]:
-        if os.path.exists(root_dir):
-            for dirpath, _, filenames in os.walk(root_dir):
-                if filename_only in filenames:
-                    found_path = os.path.join(dirpath, filename_only)
-                    if os.path.isfile(found_path):
-                        return os.path.abspath(found_path)
+        try:
+            if os.path.exists(root_dir):
+                for dirpath, _, filenames in os.walk(root_dir):
+                    if filename_only in filenames:
+                        found_path = os.path.join(dirpath, filename_only)
+                        if os.path.isfile(found_path):
+                            return os.path.abspath(found_path)
+                    if filename_unquoted in filenames:
+                        found_path = os.path.join(dirpath, filename_unquoted)
+                        if os.path.isfile(found_path):
+                            return os.path.abspath(found_path)
+        except Exception:
+            pass
 
     # 6. Try retrieving via HTTP from host web server ONLY if path indicates upload location
     if ("uploads" in p.lower() or p.startswith("http")) and not (p.startswith("http://") or p.startswith("https://")):
         clean_rel = p.lstrip("/\\").replace("\\", "/")
         host_candidates = [
-            f"http://172.17.0.1/{clean_rel}",
             f"http://localhost/{clean_rel}",
+            f"http://127.0.0.1/{clean_rel}",
+            f"http://localhost/edusoft/{clean_rel}",
+            f"http://127.0.0.1/edusoft/{clean_rel}",
+            f"http://172.17.0.1/{clean_rel}",
         ]
         for h_url in host_candidates:
             try:
@@ -382,16 +418,30 @@ def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optio
 
 FORBIDDEN_PLACEHOLDER_SUBSTRINGS = [
     "student response extracted and verified",
+    "response extracted and verified",
+    "extracted and verified across",
     "handwritten answers on uploaded pages",
     "response extracted across",
     "answer extracted for question",
     "refer to uploaded page",
+    "refer to uploaded",
     "see handwritten sheet",
+    "see uploaded image",
+    "see attached sheet",
     "verified response",
     "placeholder",
     "generic response",
     "student response transcribed",
     "handwritten response on page",
+    "response on page",
+    "extracted from page",
+    "uploaded answer page",
+    "uploaded answer page(s)",
+    "uploaded answer pages",
+    "answer sheet submitted across",
+    "scanned handwriting images attached",
+    "attached answer sheet",
+    "student response verified",
 ]
 
 
@@ -401,6 +451,89 @@ def contains_forbidden_placeholder(text: str) -> bool:
         return False
     lower = text.lower().strip()
     return any(p in lower for p in FORBIDDEN_PLACEHOLDER_SUBSTRINGS)
+
+
+def collect_booklet_images(
+    booklet: Dict[str, Any],
+    default_file_path: str = ""
+) -> List[Tuple[str, bytes, str]]:
+    """
+    Collect all high-resolution page images for a student's answer booklet.
+    Supports:
+    1. booklet['pages'] list (each page can have file_path, file_name, or base64)
+    2. booklet['page_numbers'] with a multi-page PDF (extracts rendered images per page)
+    3. Single image file_path (JPEG, PNG, WebP)
+    4. Base64 data URIs
+    """
+    images_list: List[Tuple[str, bytes, str]] = []
+    seen_hashes = set()
+
+    def add_img(name: str, data: bytes, mime: str):
+        if not data:
+            return
+        h = hash(data)
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            images_list.append((name, data, mime))
+
+    # 1. Process explicit pages list if available
+    raw_pages = booklet.get("pages")
+    if isinstance(raw_pages, str):
+        try:
+            raw_pages = json.loads(raw_pages)
+        except Exception:
+            raw_pages = []
+
+    if isinstance(raw_pages, list) and len(raw_pages) > 0:
+        for pg in raw_pages:
+            if not isinstance(pg, dict):
+                continue
+            pg_fp = pg.get("file_path") or pg.get("path") or pg.get("file_name") or ""
+            pg_res = resolve_file_location(pg_fp) if pg_fp else None
+            if pg_res and os.path.exists(pg_res):
+                if pg_res.lower().endswith(".pdf"):
+                    p_no = pg.get("page_no") or 1
+                    pdf_imgs = extract_page_images_from_pdf(pg_res, page_numbers=[int(p_no)])
+                    for iname, ibytes in pdf_imgs:
+                        add_img(iname, ibytes, "image/jpeg")
+                elif pg_res.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    try:
+                        with open(pg_res, "rb") as f:
+                            data = f.read()
+                            mime = "image/png" if pg_res.lower().endswith(".png") else "image/jpeg"
+                            add_img(os.path.basename(pg_res), data, mime)
+                    except Exception as e:
+                        logger.warning(f"Could not read page image file {pg_res}: {e}")
+            elif pg.get("image") or pg.get("data") or pg.get("image_data"):
+                raw_b64 = str(pg.get("image") or pg.get("data") or pg.get("image_data"))
+                try:
+                    if "base64," in raw_b64:
+                        raw_b64 = raw_b64.split("base64,", 1)[1]
+                    decoded = base64.b64decode(raw_b64)
+                    add_img(f"page_{pg.get('page_no', 1)}.jpg", decoded, "image/jpeg")
+                except Exception as e:
+                    logger.warning(f"Could not decode base64 page image: {e}")
+
+    # 2. If no images collected from pages, inspect default_file_path or booklet['file_path']
+    target_path = default_file_path or booklet.get("file_path") or ""
+    if not images_list and target_path:
+        resolved = resolve_file_location(target_path)
+        if resolved and os.path.exists(resolved):
+            if resolved.lower().endswith(".pdf"):
+                p_numbers = booklet.get("page_numbers", [1])
+                pdf_imgs = extract_page_images_from_pdf(resolved, page_numbers=p_numbers)
+                for iname, ibytes in pdf_imgs:
+                    add_img(iname, ibytes, "image/jpeg")
+            elif resolved.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                try:
+                    with open(resolved, "rb") as f:
+                        data = f.read()
+                        mime = "image/png" if resolved.lower().endswith(".png") else "image/jpeg"
+                        add_img(os.path.basename(resolved), data, mime)
+                except Exception as e:
+                    logger.warning(f"Could not read image file {resolved}: {e}")
+
+    return images_list
 
 
 def extract_qa_pairs_from_text(text: str) -> List[Dict[str, Any]]:
@@ -981,31 +1114,25 @@ def evaluate_student_booklet_ai(
 ) -> Dict[str, Any]:
     """
     Evaluate an individual student booklet against authoritative questions and answer key.
+    - Collects all high-res page images across the entire booklet (handling multi-page answers).
     - Decouples student identification from answer grading.
     - Accurately counts: total_questions, attempted_questions, unanswered_questions,
       evaluated_questions, pending_review_questions.
     - Strictly only passes student_name and student_id in POST response if detected on booklet.
+    - Enforces step marking sum == question obtained marks.
+    - Prevents placeholder strings and fabricated marks.
     """
     page_numbers = booklet.get("page_numbers", [1])
     page_count = len(page_numbers)
     booklet_text = booklet.get("combined_text", "")
+    booklet_idx = booklet.get("booklet_index", 1)
 
-    # Extract high-res images for this student's booklet pages
-    vision_images: List[Tuple[str, bytes, str]] = []
-    if file_path:
-        resolved_path = resolve_file_location(file_path)
-        if resolved_path and os.path.exists(resolved_path):
-            if resolved_path.lower().endswith(".pdf"):
-                extracted_imgs = extract_page_images_from_pdf(resolved_path, page_numbers=page_numbers)
-                for img_name, img_bytes in extracted_imgs:
-                    vision_images.append((img_name, img_bytes, "image/jpeg"))
-            else:
-                try:
-                    with open(resolved_path, "rb") as f:
-                        mime = "image/png" if resolved_path.lower().endswith(".png") else "image/jpeg"
-                        vision_images.append((os.path.basename(resolved_path), f.read(), mime))
-                except Exception as ie:
-                    logger.warning(f"Could not read image file {resolved_path}: {ie}")
+    # 1. Collect high-resolution page images for all pages in this student's booklet
+    vision_images = collect_booklet_images(booklet=booklet, default_file_path=file_path)
+    logger.info(
+        f"Booklet #{booklet_idx}: Loaded {len(vision_images)} image(s) across {page_count} page(s) "
+        f"(text_length={len(booklet_text)} chars)."
+    )
 
     # Initial identity from text extraction
     text_name, text_id, text_adm, text_roll, text_kuhs = extract_identity_from_document_text(booklet_text)
@@ -1025,31 +1152,41 @@ def evaluate_student_booklet_ai(
     ai_evaluated = False
     evaluated_result: Optional[Dict[str, Any]] = None
 
-    if client and (os.getenv("OPENAI_API_KEY") or hasattr(client, "chat")):
+    has_document_content = bool(vision_images or (booklet_text and booklet_text.strip()))
+
+    if client and (os.getenv("OPENAI_API_KEY") or hasattr(client, "chat")) and has_document_content:
         system_prompt = (
-            "You are an expert academic examination scoring engine for Edusoft.\n"
-            "Your objective is to evaluate a student's handwritten answer booklet against the authoritative Question Paper and Answer Key.\n\n"
-            "CRITICAL RULES:\n"
+            "You are an authoritative academic examination scoring engine for Edusoft.\n"
+            "Your objective is to evaluate a student's actual handwritten answer booklet against the authoritative Question Paper and Model Answer Key.\n\n"
+            "CRITICAL INSTRUCTIONS:\n"
             "1. VERBATIM HANDWRITTEN TRANSCRIPTION:\n"
-            "   - For each question in the Question Paper, locate the student's handwritten response across all booklet pages (including multi-page continuations).\n"
-            "   - Transcribe the student's ACTUAL visible handwritten text, equations, calculations, and diagrams into 'student_response'.\n"
-            "   - NEVER use generic placeholders such as 'Student response extracted and verified', '[Handwritten answers on uploaded pages]', 'Response extracted across pages', etc. Generic placeholders are strictly prohibited.\n\n"
+            "   - For every question in the Question Paper, locate the student's handwritten response across all provided answer sheet images.\n"
+            "   - MULTI-PAGE ANSWERS: A student's handwritten answer for a question may start on one page and continue onto subsequent pages. You must search across all attached pages to transcribe the student's complete answer.\n"
+            "   - Transcribe the student's ACTUAL visible handwritten text, equations, formulas, calculations, and diagrams into 'student_response'.\n"
+            "   - STRICT PROHIBITION: DO NOT emit generic summary/placeholder phrases (e.g. 'Student response extracted and verified across X uploaded answer page(s)', 'Response extracted across pages', 'Handwritten answers on uploaded pages'). Generic placeholder text is strictly forbidden.\n"
+            "   - DO NOT copy the answer key into student_response.\n\n"
             "2. ATTEMPT & READABILITY DETERMINATION:\n"
-            "   - If a question was skipped or blank: set is_attempted = false, pending_review = false, obtained_marks = 0.0, student_response = '[Unanswered]'.\n"
-            "   - If an answer is crossed out with no final response: set is_attempted = false, pending_review = false, obtained_marks = 0.0, student_response = '[Crossed out]'.\n"
-            "   - If handwriting is illegible, conflicting, or cannot be deciphered reliably: set is_attempted = true, pending_review = true, obtained_marks = 0.0, student_response = '[Illegible handwriting - Flagged for manual review]', and explain in 'feedback'. NEVER invent an answer or guess marks for illegible handwriting!\n"
-            "   - If substantive handwritten work is present and legible: set is_attempted = true, pending_review = false.\n\n"
-            "3. RUBRIC-BASED MARKING AGAINST ANSWER KEY:\n"
-            "   - Compare the student's transcribed answer with the model answer and marking rubrics from the Answer Key.\n"
-            "   - Assess factual correctness, conceptual understanding, formulas, steps, and required detail.\n"
-            "   - Accept semantically equivalent answers even if wording differs from the model answer.\n"
-            "   - Award partial credit with detailed step marking ONLY when the student's work demonstrates relevant correct knowledge.\n"
-            "   - Award zero marks if the answer is completely incorrect, irrelevant, or blank.\n"
-            "   - NEVER use fixed scoring factors (such as 65%, 70%, 75%, 80%) or award marks simply because text is present on the page.\n\n"
-            "4. ANSWER-SPECIFIC FEEDBACK:\n"
-            "   - 'feedback' for each question MUST cite the student's specific written statements, correct steps, and specific errors or missing concepts.\n"
-            "   - 'ai_feedback', 'ai_insights.recommendation', 'ai_insights.focus_areas', and 'ai_insights.strengths' MUST reflect the student's actual performance on these questions.\n"
-            "   - NEVER include unrelated comments about attendance, enrollment, fees, or administration.\n\n"
+            "   - Blank / Unanswered question: If the question was skipped or not attempted, set is_attempted = false, pending_review = false, obtained_marks = 0.0, student_response = '[Unanswered]'.\n"
+            "   - Struck-through answer: If the work was crossed out with no subsequent answer, set is_attempted = false, pending_review = false, obtained_marks = 0.0, student_response = '[Crossed out]'.\n"
+            "   - Illegible handwriting: If the writing is blurred, indecipherable, or conflicting, set is_attempted = true, pending_review = true, obtained_marks = 0.0, student_response = '[Illegible handwriting - Flagged for manual review]'. Explain in 'feedback'. NEVER guess marks for illegible handwriting!\n"
+            "   - Unassociated answer: If handwritten work is present but cannot be confidently mapped to a question, set is_attempted = true, pending_review = true, obtained_marks = 0.0, student_response = '[Unassociated response - Flagged for manual review]'.\n"
+            "   - Legible attempt: If substantive handwritten work is visible and decipherable, set is_attempted = true, pending_review = false.\n\n"
+            "3. STRICT RUBRIC EVALUATION AGAINST ANSWER KEY:\n"
+            "   - Compare the student's transcribed answer with the model answer and marking criteria for that specific question.\n"
+            "   - Award partial credit based on relevant correct concepts, formulas, steps, reasoning, and completeness.\n"
+            "   - Accept scientifically correct equivalent phrasing and terminology.\n"
+            "   - Never award marks using fixed multipliers (e.g. 65%, 70%, 75%, 80%) or default scores.\n"
+            "   - Never award marks simply because text is present on the page.\n"
+            "   - Each step's obtained marks must be between 0.0 and its max marks.\n"
+            "   - The step marks MUST sum exactly to the question's obtained_marks.\n"
+            "   - Question obtained_marks must be between 0.0 and max_marks.\n"
+            "   - If the answer is completely incorrect or irrelevant, award 0.0.\n\n"
+            "4. ANSWER-SPECIFIC FEEDBACK & INSIGHTS:\n"
+            "   - 'feedback' for each question MUST cite the student's specific written statements, correct points, and missing or erroneous concepts.\n"
+            "   - 'ai_feedback' MUST be an academic diagnostic summary of the student's performance on these specific exam questions.\n"
+            "   - NEVER include unrelated comments about attendance, enrollment, working days, fees, or administration.\n"
+            "   - 'ai_insights.recommendation', 'focus_areas', and 'strengths' must strictly reflect the evaluated examination topics.\n"
+            "   - If evaluation is unsuccessful or handwriting is unreadable, report that evaluation could not be completed and manual review is required; NEVER generate positive feedback for failed evaluations.\n\n"
             "5. INDEPENDENT IDENTITY EXTRACTION:\n"
             "   - ONLY extract detected_student_name and detected_student_id if VISIBLY written on this booklet cover or header.\n"
             "   - If not visibly written on the document, return null for both and set recognition_status = 'unmatched'.\n"
@@ -1122,7 +1259,10 @@ Return a single JSON object with this EXACT schema:
         max_vision_retries = 2
         for attempt in range(max_vision_retries + 1):
             try:
-                logger.info(f"OpenAI Vision evaluation attempt {attempt + 1}/{max_vision_retries + 1} for booklet across {page_count} page(s)")
+                logger.info(
+                    f"OpenAI Vision evaluation attempt {attempt + 1}/{max_vision_retries + 1} "
+                    f"for booklet #{booklet_idx} across {len(vision_images)} image(s)"
+                )
                 completion = client.chat.completions.create(
                     model=model,
                     messages=[
@@ -1168,17 +1308,17 @@ Return a single JSON object with this EXACT schema:
                     elif vision_images:
                         detected_student_id = None
 
-                    logger.info(f"OpenAI evaluation successful. Detected Name: {detected_student_name}, ID: {detected_student_id}")
+                    logger.info(f"OpenAI evaluation successful for booklet #{booklet_idx}. Detected Name: {detected_student_name}, ID: {detected_student_id}")
                     break
                 else:
                     logger.warning(f"OpenAI returned empty evaluation breakdown on attempt {attempt + 1}")
             except Exception as e:
-                logger.warning(f"OpenAI vision attempt {attempt + 1} failed: {e}")
+                logger.warning(f"OpenAI vision attempt {attempt + 1} failed for booklet #{booklet_idx}: {e}")
                 if attempt < max_vision_retries:
                     import time
                     time.sleep(1.0)
                 else:
-                    logger.error(f"All OpenAI Vision evaluation attempts failed for booklet: {e}")
+                    logger.error(f"All OpenAI Vision evaluation attempts failed for booklet #{booklet_idx}: {e}")
 
     # Process evaluation breakdown strictly without fabricating marks
     normalized_breakdown: List[Dict[str, Any]] = []
@@ -1186,6 +1326,7 @@ Return a single JSON object with this EXACT schema:
     if ai_evaluated and evaluated_result:
         raw_breakdown = evaluated_result.get("evaluation_breakdown") or []
         breakdown_by_qno = {q.get("question_no"): q for q in raw_breakdown if isinstance(q, dict)}
+        logger.info(f"Booklet #{booklet_idx}: Matched {len(breakdown_by_qno)}/{len(questions)} question(s) from AI breakdown.")
 
         for q_item in questions:
             q_num = q_item.get("question_no")
@@ -1201,55 +1342,128 @@ Return a single JSON object with this EXACT schema:
 
                 student_resp = str(b_item.get("student_response", "")).strip()
 
+                # Validate answer key presence
+                if not q_key or not str(q_key).strip():
+                    logger.warning(f"Question {q_num} has missing answer key. Flagging for manual review.")
+                    b_item["pending_review"] = True
+                    b_item["obtained_marks"] = 0.0
+                    b_item["feedback"] = f"Missing answer key / model answer for Question {q_num}. Question cannot be evaluated without authoritative marking criteria."
+                    b_item["step_marking"] = [
+                        {
+                            "step": "Manual Verification Required (Missing Answer Key)",
+                            "max_marks": q_max,
+                            "obtained_marks": 0.0,
+                            "status": "Zero"
+                        }
+                    ]
                 # Strictly reject forbidden generic placeholders
-                if contains_forbidden_placeholder(student_resp):
+                elif contains_forbidden_placeholder(student_resp):
                     logger.warning(f"Question {q_num} response contained forbidden placeholder: '{student_resp}'. Flagging for manual review.")
                     b_item["is_attempted"] = True
                     b_item["pending_review"] = True
                     b_item["obtained_marks"] = 0.0
                     b_item["student_response"] = "[Unverified transcription - Flagged for manual review]"
                     b_item["feedback"] = "Automated model output contained generic placeholder text instead of verified transcription. Flagged for manual review."
-                elif b_item.get("pending_review"):
-                    # Questions flagged for review cannot have fabricated marks
-                    b_item["obtained_marks"] = 0.0
-                    b_item["is_attempted"] = True
-                    if not student_resp:
-                        b_item["student_response"] = "[Illegible handwriting - Flagged for manual review]"
-                elif not b_item.get("is_attempted"):
-                    b_item["obtained_marks"] = 0.0
-                    b_item["pending_review"] = False
-                    b_item["student_response"] = student_resp if student_resp in ["[Crossed out]", "[Unanswered]"] else "[Unanswered]"
-                    b_item["feedback"] = b_item.get("feedback") or f"Question {q_num} was not attempted by the student."
-                else:
-                    # Legitimate evaluated answer: validate marks bounds
-                    raw_obt = float(b_item.get("obtained_marks", 0.0))
-                    b_item["obtained_marks"] = max(0.0, min(round(raw_obt, 1), q_max))
-                    b_item["pending_review"] = False
-
-                # Validate step marking
-                steps = b_item.get("step_marking") or []
-                if b_item.get("pending_review") or not b_item.get("is_attempted"):
                     b_item["step_marking"] = [
                         {
-                            "step": "Manual Verification Required" if b_item.get("pending_review") else "Question attempted",
+                            "step": "Manual Verification Required",
                             "max_marks": q_max,
                             "obtained_marks": 0.0,
                             "status": "Zero"
                         }
                     ]
-                elif steps:
-                    validated_steps = []
-                    for st in steps:
-                        st_max = float(st.get("max_marks", 0.0))
-                        st_obt = max(0.0, min(float(st.get("obtained_marks", 0.0)), st_max))
-                        st_status = "Full" if (st_obt >= st_max and st_max > 0) else ("Partial" if st_obt > 0 else "Zero")
-                        validated_steps.append({
-                            "step": str(st.get("step", "Criteria")).strip(),
-                            "max_marks": round(st_max, 1),
-                            "obtained_marks": round(st_obt, 1),
-                            "status": st_status
-                        })
-                    b_item["step_marking"] = validated_steps
+                # Reject copied answer key
+                elif len(student_resp) > 30 and q_key and student_resp.lower() == q_key.strip().lower():
+                    logger.warning(f"Question {q_num} student response duplicated model answer key. Flagging for review.")
+                    b_item["is_attempted"] = True
+                    b_item["pending_review"] = True
+                    b_item["obtained_marks"] = 0.0
+                    b_item["student_response"] = "[Flagged for review - Answer key duplication detected]"
+                    b_item["feedback"] = "Student response duplicated the answer key. Flagged for manual instructor review."
+                    b_item["step_marking"] = [
+                        {
+                            "step": "Manual Verification Required",
+                            "max_marks": q_max,
+                            "obtained_marks": 0.0,
+                            "status": "Zero"
+                        }
+                    ]
+                elif b_item.get("pending_review"):
+                    # Questions flagged for review cannot have fabricated marks
+                    b_item["obtained_marks"] = 0.0
+                    b_item["is_attempted"] = True
+                    if not student_resp or student_resp == "[Illegible handwriting - Flagged for manual review]":
+                        b_item["student_response"] = "[Illegible handwriting - Flagged for manual review]"
+                    b_item["step_marking"] = [
+                        {
+                            "step": "Manual Verification Required",
+                            "max_marks": q_max,
+                            "obtained_marks": 0.0,
+                            "status": "Zero"
+                        }
+                    ]
+                elif not b_item.get("is_attempted"):
+                    b_item["obtained_marks"] = 0.0
+                    b_item["pending_review"] = False
+                    b_item["student_response"] = student_resp if student_resp in ["[Crossed out]", "[Unanswered]"] else "[Unanswered]"
+                    b_item["feedback"] = b_item.get("feedback") or f"Question {q_num} was not attempted by the student."
+                    b_item["step_marking"] = [
+                        {
+                            "step": "Question attempted",
+                            "max_marks": q_max,
+                            "obtained_marks": 0.0,
+                            "status": "Zero"
+                        }
+                    ]
+                else:
+                    # Legitimate evaluated answer: validate marks bounds and step marking
+                    raw_obt = float(b_item.get("obtained_marks", 0.0))
+                    b_item["obtained_marks"] = max(0.0, min(round(raw_obt, 1), q_max))
+                    b_item["pending_review"] = False
+
+                    steps = b_item.get("step_marking") or []
+                    if steps:
+                        validated_steps = []
+                        for st in steps:
+                            st_max = float(st.get("max_marks", 0.0))
+                            st_obt = max(0.0, min(float(st.get("obtained_marks", 0.0)), st_max))
+                            st_status = "Full" if (st_obt >= st_max and st_max > 0) else ("Partial" if st_obt > 0 else "Zero")
+                            validated_steps.append({
+                                "step": str(st.get("step", "Criteria")).strip(),
+                                "max_marks": round(st_max, 1),
+                                "obtained_marks": round(st_obt, 1),
+                                "status": st_status
+                            })
+                        # Invariant: step marks sum must equal question obtained marks
+                        step_sum = round(sum(st["obtained_marks"] for st in validated_steps), 1)
+                        if abs(step_sum - b_item["obtained_marks"]) > 0.01:
+                            logger.warning(
+                                f"Question {q_num}: Step marks sum ({step_sum}) differed from question marks ({b_item['obtained_marks']}). Reconciling."
+                            )
+                            if step_sum > 0:
+                                b_item["obtained_marks"] = min(q_max, step_sum)
+                            else:
+                                validated_steps[0]["obtained_marks"] = b_item["obtained_marks"]
+                                validated_steps[0]["status"] = "Full" if b_item["obtained_marks"] >= validated_steps[0]["max_marks"] else "Partial"
+                        b_item["step_marking"] = validated_steps
+                    else:
+                        b_item["step_marking"] = [
+                            {
+                                "step": f"Criteria for Question {q_num}",
+                                "max_marks": q_max,
+                                "obtained_marks": b_item["obtained_marks"],
+                                "status": "Full" if b_item["obtained_marks"] >= q_max else ("Partial" if b_item["obtained_marks"] > 0 else "Zero")
+                            }
+                        ]
+
+                # Sanitize question-level feedback (remove any attendance/enrollment terms)
+                q_fb = str(b_item.get("feedback", "")).strip()
+                unwanted_q = ["attendance", "enrollment", "working days", "academic assessments are pending"]
+                if any(u in q_fb.lower() for u in unwanted_q):
+                    b_item["feedback"] = (
+                        f"Evaluated against Question {q_num} rubric. "
+                        f"Student achieved {b_item['obtained_marks']}/{q_max} marks."
+                    )
 
                 logger.info(
                     f"Question {q_num}: attempted={b_item.get('is_attempted')}, "
@@ -1259,7 +1473,7 @@ Return a single JSON object with this EXACT schema:
                 normalized_breakdown.append(b_item)
             else:
                 # Question not located in model breakdown
-                is_substantive = bool(vision_images or booklet_text)
+                is_substantive = bool(has_document_content)
                 logger.warning(f"Question {q_num} was omitted from AI breakdown. Flagging for review: substantive={is_substantive}")
                 normalized_breakdown.append({
                     "question_no": q_num,
@@ -1283,8 +1497,7 @@ Return a single JSON object with this EXACT schema:
                 })
     else:
         # AI evaluation was unavailable or completely failed: DO NOT INVENT MARKS OR FALLBACK MULTIPLIERS!
-        logger.warning(f"AI evaluation unavailable or failed for booklet. Flagging all {len(questions)} question(s) for manual review.")
-        has_content = bool(vision_images or booklet_text)
+        logger.warning(f"AI evaluation unavailable or failed for booklet #{booklet_idx}. Flagging all {len(questions)} question(s) for manual review.")
         for q_item in questions:
             q_num = q_item.get("question_no")
             q_max = float(q_item.get("max_marks", 10.0))
@@ -1294,10 +1507,10 @@ Return a single JSON object with this EXACT schema:
                 "question_type": q_item.get("question_type", "Descriptive"),
                 "max_marks": q_max,
                 "obtained_marks": 0.0,
-                "is_attempted": has_content,
+                "is_attempted": has_document_content,
                 "pending_review": True,
                 "answer_key": q_item.get("model_answer") or q_item.get("answer_key", ""),
-                "student_response": "[Automated evaluation unavailable - Flagged for manual review]",
+                "student_response": "[Answer sheet unreadable or could not be loaded - Flagged for manual review]" if not has_document_content else "[Automated evaluation unavailable - Flagged for manual review]",
                 "step_marking": [
                     {
                         "step": "Manual Verification Required",
@@ -1308,16 +1521,6 @@ Return a single JSON object with this EXACT schema:
                 ],
                 "feedback": f"Automated AI evaluation could not process Question {q_num}. Flagged for manual instructor review."
             })
-
-        evaluated_result = {
-            "ai_feedback": f"Automated evaluation could not reliably process this answer booklet. All {len(questions)} question(s) have been flagged for manual instructor review.",
-            "ai_insights": {
-                "recommendation": "Manual instructor review required.",
-                "focus_areas": [],
-                "strengths": []
-            },
-            "evaluation_breakdown": normalized_breakdown
-        }
 
     # Precise Metric Calculations
     total_q_count = len(normalized_breakdown)
@@ -1334,7 +1537,7 @@ Return a single JSON object with this EXACT schema:
     percentage_score = round((summed_obtained / authoritative_max) * 100.0, 2) if authoritative_max > 0 else 0.0
 
     # Derive grade and pass/fail status
-    if pending_review_q_count > 0 and evaluated_q_count == 0:
+    if (pending_review_q_count > 0 and evaluated_q_count == 0) or total_q_count == 0:
         grade_score = "Pending"
         status_score = "Pending Review"
     else:
@@ -1342,11 +1545,67 @@ Return a single JSON object with this EXACT schema:
         status_score = determine_status(percentage_score)
 
     logger.info(
-        f"Booklet {booklet.get('booklet_index', 1)} evaluation complete: "
+        f"Booklet #{booklet_idx} evaluation complete: "
         f"Score={summed_obtained}/{authoritative_max} ({percentage_score}%), "
         f"Grade={grade_score}, Status={status_score}, Evaluated={evaluated_q_count}, "
         f"Pending={pending_review_q_count}, Unanswered={unanswered_q_count}"
     )
+
+    # Sanitize ai_feedback and ai_insights
+    raw_ai_feedback = str(evaluated_result.get("ai_feedback", "")).strip() if evaluated_result else ""
+    raw_ai_insights = evaluated_result.get("ai_insights", {}) if evaluated_result else {}
+    if not isinstance(raw_ai_insights, dict):
+        raw_ai_insights = {}
+
+    unwanted_phrases = [
+        "academic assessments are pending",
+        "assessments are pending",
+        "attendance",
+        "working days",
+        "enrollment",
+        "present days",
+        "absent days",
+        "late days",
+        "fee balance",
+        "fee status"
+    ]
+    has_unwanted = any(u in raw_ai_feedback.lower() for u in unwanted_phrases)
+
+    if evaluated_q_count == 0 or pending_review_q_count == total_q_count:
+        final_ai_feedback = f"Automated evaluation could not complete reliable handwriting scoring for this answer booklet. All {total_q_count} question(s) have been flagged for manual instructor review."
+        final_ai_insights = {
+            "recommendation": "Manual instructor review required.",
+            "focus_areas": [],
+            "strengths": []
+        }
+    elif not raw_ai_feedback or has_unwanted:
+        final_ai_feedback = (
+            f"Student achieved {summed_obtained}/{authoritative_max} ({percentage_score}%) with grade {grade_score} "
+            f"across {evaluated_q_count} evaluated question(s). Performance reflects understanding in core topics "
+            f"with specific areas identified for academic improvement."
+        )
+        rec = str(raw_ai_insights.get("recommendation", "")).strip()
+        if not rec or any(u in rec.lower() for u in unwanted_phrases):
+            rec = "Review question feedback and reinforce concepts where partial or zero credit was awarded."
+        focus = [str(f).strip() for f in raw_ai_insights.get("focus_areas", []) if not any(u in str(f).lower() for u in unwanted_phrases)]
+        strengths = [str(s).strip() for s in raw_ai_insights.get("strengths", []) if not any(u in str(s).lower() for u in unwanted_phrases)]
+        final_ai_insights = {
+            "recommendation": rec,
+            "focus_areas": focus if focus else [f"{subject_title} foundational concepts"],
+            "strengths": strengths if strengths else [f"Attempted {attempted_q_count} question(s)"]
+        }
+    else:
+        rec = str(raw_ai_insights.get("recommendation", "")).strip()
+        if not rec or any(u in rec.lower() for u in unwanted_phrases):
+            rec = "Review question feedback and reinforce key subject topics."
+        focus = [str(f).strip() for f in raw_ai_insights.get("focus_areas", []) if not any(u in str(f).lower() for u in unwanted_phrases)]
+        strengths = [str(s).strip() for s in raw_ai_insights.get("strengths", []) if not any(u in str(s).lower() for u in unwanted_phrases)]
+        final_ai_feedback = raw_ai_feedback
+        final_ai_insights = {
+            "recommendation": rec,
+            "focus_areas": focus,
+            "strengths": strengths
+        }
 
     # STRICT IDENTITY ENFORCEMENT FOR POST RESPONSE:
     has_name = bool(detected_student_name and str(detected_student_name).strip())
@@ -1410,8 +1669,8 @@ Return a single JSON object with this EXACT schema:
         "percentage": percentage_score,
         "grade": grade_score,
         "status": status_score,
-        "ai_feedback": evaluated_result.get("ai_feedback", ""),
-        "ai_insights": evaluated_result.get("ai_insights", {}),
+        "ai_feedback": final_ai_feedback,
+        "ai_insights": final_ai_insights,
         "evaluation_breakdown": normalized_breakdown
     }
 
@@ -1646,11 +1905,20 @@ def process_paper_evaluation(
                 if resolved_f and resolved_f.lower().endswith(".pdf"):
                     pdf_disk_text, _ = extract_text_from_pdf(resolved_f)
 
+                raw_pgs = s_data.get("pages")
+                if not raw_pgs and s_data.get("pages_json"):
+                    try:
+                        raw_pgs = json.loads(s_data["pages_json"])
+                    except Exception:
+                        raw_pgs = []
+
                 booklet_obj = {
                     "booklet_index": idx,
-                    "page_numbers": list(range(1, p_cnt + 1)),
+                    "page_numbers": list(range(1, max(p_cnt, len(raw_pgs) if isinstance(raw_pgs, list) else 1) + 1)),
                     "combined_text": pdf_disk_text,
-                    "pages": s_data.get("pages") or []
+                    "pages": raw_pgs or [],
+                    "file_path": f_path,
+                    "file_name": f_name
                 }
                 student_res = evaluate_student_booklet_ai(
                     booklet=booklet_obj,
@@ -1703,9 +1971,12 @@ def process_paper_evaluation(
 
         get_students_list = []
         for idx, s in enumerate(evaluated_students, start=1):
+            is_pending = s.get("status") == "Pending Review"
+            default_rec = "Manual instructor review required." if is_pending else f"Review performance and feedback for {subject_name}."
+            rec_val = s["ai_insights"].get("recommendation") if isinstance(s.get("ai_insights"), dict) else ""
             insights_compact = {
-                "recommendation": s["ai_insights"].get("recommendation", f"Demonstrated proficiency in {subject_name}."),
-                "focus_areas": s["ai_insights"].get("focus_areas", [])
+                "recommendation": rec_val or default_rec,
+                "focus_areas": s["ai_insights"].get("focus_areas", []) if isinstance(s.get("ai_insights"), dict) else []
             }
             record_id = s.get("id") or idx
             is_extracted = (s.get("recognition_status") == "matched") and bool(s.get("student_name") or s.get("student_id"))
