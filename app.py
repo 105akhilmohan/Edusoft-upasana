@@ -1890,7 +1890,7 @@ def get_evaluation_by_id(evaluation_id):
     """
     Retrieve stored evaluation details and student marks by evaluation ID.
     Matches exact GET_RESPONSE specification.
-    Strictly removes student_name and student_id from returned student objects.
+    Returns student identity in GET response ONLY when extracted from PDF/Image.
     """
     record = evaluation_store.get_evaluation(evaluation_id)
     if not record:
@@ -1898,13 +1898,21 @@ def get_evaluation_by_id(evaluation_id):
             "status": "error",
             "message": f"Evaluation #{evaluation_id} not found."
         }), 404
-    # Requirement 6: Guarantee student_name and student_id are removed from GET response
+    # Enforce: Return student identity in GET response ONLY when extracted from PDF/Image
     if isinstance(record, dict) and "data" in record and isinstance(record["data"], dict):
         if "students" in record["data"] and isinstance(record["data"]["students"], list):
             for s in record["data"]["students"]:
                 if isinstance(s, dict):
-                    s.pop("student_name", None)
-                    s.pop("student_id", None)
+                    if s.get("recognition_status") != "matched" or not (s.get("student_name") or s.get("student_id")):
+                        s["student_name"] = ""
+                        s["student_id"] = ""
+                        s["admission_no"] = ""
+                        s["roll_no"] = ""
+                        s["kuhs_reg_no"] = ""
+                        s["student_image"] = ""
+                        s["recognized_text"] = ""
+                        s["recognition_status"] = "unmatched"
+                        s["recognition_confidence"] = 0.0
     return jsonify(record), 200
 
 
@@ -1913,7 +1921,7 @@ def get_evaluation_by_id(evaluation_id):
 def get_evaluation_breakdown(evaluation_id):
     """
     Retrieve full question-by-question step-marking breakdown for an evaluation.
-    Strictly removes student_name and student_id from returned student objects.
+    Returns student identity in GET response ONLY when extracted from PDF/Image.
     """
     record = evaluation_store.get_post_evaluation(evaluation_id)
     if not record:
@@ -1925,8 +1933,16 @@ def get_evaluation_breakdown(evaluation_id):
     if isinstance(rec_copy, dict) and "students" in rec_copy and isinstance(rec_copy["students"], list):
         for s in rec_copy["students"]:
             if isinstance(s, dict):
-                s.pop("student_name", None)
-                s.pop("student_id", None)
+                if s.get("recognition_status") != "matched" or not (s.get("student_name") or s.get("student_id")):
+                    s["student_name"] = ""
+                    s["student_id"] = ""
+                    s["admission_no"] = ""
+                    s["roll_no"] = ""
+                    s["kuhs_reg_no"] = ""
+                    s["student_image"] = ""
+                    s["recognized_text"] = ""
+                    s["recognition_status"] = "unmatched"
+                    s["recognition_confidence"] = 0.0
     return jsonify(rec_copy), 200
 
 
@@ -1935,7 +1951,7 @@ def get_evaluation_breakdown(evaluation_id):
 def get_student_evaluation_breakdown(evaluation_id, student_id):
     """
     Retrieve individual student's detailed evaluation sheet with step-marking breakdown.
-    Strictly removes student_name and student_id from returned student object.
+    Returns student identity in GET response ONLY when extracted from PDF/Image.
     """
     student_eval = evaluation_store.get_student_evaluation(evaluation_id, student_id)
     if not student_eval:
@@ -1945,8 +1961,16 @@ def get_student_evaluation_breakdown(evaluation_id, student_id):
         }), 404
     s_copy = json.loads(json.dumps(student_eval))
     if isinstance(s_copy, dict):
-        s_copy.pop("student_name", None)
-        s_copy.pop("student_id", None)
+        if s_copy.get("recognition_status") != "matched" or not (s_copy.get("student_name") or s_copy.get("student_id")):
+            s_copy["student_name"] = ""
+            s_copy["student_id"] = ""
+            s_copy["admission_no"] = ""
+            s_copy["roll_no"] = ""
+            s_copy["kuhs_reg_no"] = ""
+            s_copy["student_image"] = ""
+            s_copy["recognized_text"] = ""
+            s_copy["recognition_status"] = "unmatched"
+            s_copy["recognition_confidence"] = 0.0
     return jsonify({
         "status": "success",
         "evaluation_id": evaluation_id,

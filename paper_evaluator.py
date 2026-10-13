@@ -816,13 +816,22 @@ class EvaluationStore:
         get_resp = record.get("get_response")
         if not get_resp:
             return None
-        # Deepcopy and guarantee student_name and student_id are removed
         safe_resp = json.loads(json.dumps(get_resp))
         if isinstance(safe_resp, dict) and "data" in safe_resp and isinstance(safe_resp["data"], dict):
             for s in safe_resp["data"].get("students", []):
                 if isinstance(s, dict):
-                    s.pop("student_name", None)
-                    s.pop("student_id", None)
+                    # Return student identity ONLY when extracted from PDF/Image
+                    is_extracted = (s.get("recognition_status") == "matched") and bool(s.get("student_name") or s.get("student_id"))
+                    if not is_extracted:
+                        s["student_name"] = ""
+                        s["student_id"] = ""
+                        s["admission_no"] = ""
+                        s["roll_no"] = ""
+                        s["kuhs_reg_no"] = ""
+                        s["student_image"] = ""
+                        s["recognized_text"] = ""
+                        s["recognition_status"] = "unmatched"
+                        s["recognition_confidence"] = 0.0
         return safe_resp
 
     def get_post_evaluation(self, eval_id: str) -> Optional[Dict[str, Any]]:
@@ -841,9 +850,18 @@ class EvaluationStore:
                 or str(s.get("id")) == str(student_identifier)
             ):
                 s_copy = json.loads(json.dumps(s))
-                # Remove student identity fields from GET response
-                s_copy.pop("student_name", None)
-                s_copy.pop("student_id", None)
+                # Return student identity ONLY when extracted from PDF/Image
+                is_extracted = (s_copy.get("recognition_status") == "matched") and bool(s_copy.get("student_name") or s_copy.get("student_id"))
+                if not is_extracted:
+                    s_copy["student_name"] = ""
+                    s_copy["student_id"] = ""
+                    s_copy["admission_no"] = ""
+                    s_copy["roll_no"] = ""
+                    s_copy["kuhs_reg_no"] = ""
+                    s_copy["student_image"] = ""
+                    s_copy["recognized_text"] = ""
+                    s_copy["recognition_status"] = "unmatched"
+                    s_copy["recognition_confidence"] = 0.0
                 return s_copy
         return None
 
@@ -1451,7 +1469,7 @@ def process_paper_evaluation(
         if payload.get("include_evaluation_id") or payload.get("include_id"):
             post_response["evaluation_id"] = int(eval_id) if eval_id.isdigit() else eval_id
 
-        # 6. Build GET response (STRICT REQUIREMENT 6: Remove student_name and student_id)
+        # 6. Build GET response (Return Student Identity ONLY when extracted from PDF/Image)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -1462,15 +1480,19 @@ def process_paper_evaluation(
                 "focus_areas": s["ai_insights"].get("focus_areas", [])
             }
             record_id = s.get("id") or idx
-            # Strictly OMIT student_name and student_id from GET response
+            is_extracted = (s.get("recognition_status") == "matched") and bool(s.get("student_name") or s.get("student_id"))
             get_students_list.append({
                 "id": str(record_id),
                 "evaluation_id": str(eval_id),
-                "admission_no": s.get("admission_no", ""),
-                "roll_no": str(s.get("roll_no", "")),
-                "kuhs_reg_no": str(s.get("kuhs_reg_no", "")),
-                "student_image": s.get("student_image", ""),
-                "recognized_text": s.get("recognized_text", ""),
+                "student_id": str(s.get("student_id", "")) if is_extracted else "",
+                "student_name": s.get("student_name", "") if is_extracted else "",
+                "admission_no": s.get("admission_no", "") if is_extracted else "",
+                "roll_no": str(s.get("roll_no", "")) if is_extracted else "",
+                "kuhs_reg_no": str(s.get("kuhs_reg_no", "")) if is_extracted else "",
+                "student_image": s.get("student_image", "") if is_extracted else "",
+                "recognized_text": s.get("recognized_text", "") if is_extracted else "",
+                "recognition_status": "matched" if is_extracted else "unmatched",
+                "recognition_confidence": s.get("recognition_confidence", 0.0) if is_extracted else 0.0,
                 "file_name": s.get("file_name", ""),
                 "file_path": s.get("file_path", ""),
                 "total_questions": s.get("total_questions", 0),
