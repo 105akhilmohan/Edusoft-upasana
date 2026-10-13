@@ -141,36 +141,51 @@ def resolve_file_location(path_or_url: str) -> Optional[str]:
     return None
 
 
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract readable text from all pages of a PDF using pdfplumber."""
+def extract_text_from_pdf(pdf_path: str) -> Tuple[str, int]:
+    """Extract readable text and page count from all pages of a PDF using pdfplumber."""
     try:
         import pdfplumber
         extracted_pages = []
+        total_pages = 1
         with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
             for page_idx, page in enumerate(pdf.pages, start=1):
                 t = page.extract_text()
                 if t and t.strip():
                     extracted_pages.append(f"--- PAGE {page_idx} ---\n{t.strip()}")
-        return "\n\n".join(extracted_pages).strip()
+        return "\n\n".join(extracted_pages).strip(), total_pages
     except Exception as e:
         logger.warning(f"pdfplumber extraction failed on {pdf_path}: {e}")
-        return ""
+        return "", 1
 
 
-def extract_images_from_pdf(pdf_path: str, max_pages: int = 5) -> List[Tuple[str, bytes]]:
-    """Extract page images from a scanned PDF to pass to OpenAI Vision."""
+def extract_images_from_pdf(pdf_path: str, max_pages: int = 10) -> List[Tuple[str, bytes]]:
+    """Extract high-resolution page images from a handwritten/scanned PDF for OpenAI Vision OCR."""
     extracted = []
     try:
         import pdfplumber
         with pdfplumber.open(pdf_path) as pdf:
             for page_idx, page in enumerate(pdf.pages[:max_pages], start=1):
+                img_bytes = None
                 try:
                     img_obj = page.to_image(resolution=150)
                     buf = io.BytesIO()
-                    img_obj.original.save(buf, format="JPEG")
-                    extracted.append((f"page_{page_idx}.jpg", buf.getvalue()))
+                    img_obj.original.save(buf, format="JPEG", quality=90)
+                    img_bytes = buf.getvalue()
                 except Exception as page_err:
-                    logger.debug(f"Could not render page {page_idx} as image: {page_err}")
+                    logger.debug(f"Could not render page {page_idx} as image with pdfplumber: {page_err}")
+                    # Fallback to embedded image extraction
+                    try:
+                        for img_dict in page.images:
+                            stream = img_dict.get("stream")
+                            if stream and hasattr(stream, "get_data"):
+                                img_bytes = stream.get_data()
+                                break
+                    except Exception:
+                        pass
+
+                if img_bytes:
+                    extracted.append((f"page_{page_idx}.jpg", img_bytes))
     except Exception as e:
         logger.warning(f"Could not extract images from PDF {pdf_path}: {e}")
     return extracted
@@ -395,12 +410,12 @@ def evaluate_student_submission_ai(
     if resolved_path and os.path.exists(resolved_path):
         is_pdf = resolved_path.lower().endswith(".pdf") or file_type == "pdf"
         if is_pdf:
-            extracted_pdf_text = extract_text_from_pdf(resolved_path)
-            # If PDF contains scanned images without text layer, extract page images for Vision
-            if len(extracted_pdf_text.strip()) < 50:
-                pdf_imgs = extract_images_from_pdf(resolved_path, max_pages=page_count)
-                for img_name, img_bytes in pdf_imgs:
-                    vision_images.append((img_name, img_bytes, "image/jpeg"))
+            extracted_pdf_text, actual_page_count = extract_text_from_pdf(resolved_path)
+            page_count = max(page_count, actual_page_count)
+            # Handwritten PDF: ALWAYS extract high-res page images for OpenAI Vision handwriting OCR
+            pdf_imgs = extract_images_from_pdf(resolved_path, max_pages=max(10, page_count))
+            for img_name, img_bytes in pdf_imgs:
+                vision_images.append((img_name, img_bytes, "image/jpeg"))
         else:
             # It's an image file (JPG, PNG, WebP)
             try:
@@ -535,7 +550,8 @@ Return a single JSON object with this EXACT schema:
                     user_content.append({
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:{mime};base64,{b64_img}"
+                            "url": f"data:{mime};base64,{b64_img}",
+                            "detail": "high"
                         }
                     })
             else:
@@ -884,7 +900,8 @@ def process_paper_evaluation(
         if answer_key_file:
             resolved_key_path = resolve_file_location(answer_key_file)
             if resolved_key_path and resolved_key_path.lower().endswith(".pdf"):
-                answer_key_content = extract_text_from_pdf(resolved_key_path)
+                key_text, _ = extract_text_from_pdf(resolved_key_path)
+                answer_key_content = key_text
             elif resolved_key_path and os.path.exists(resolved_key_path):
                 try:
                     with open(resolved_key_path, "r", encoding="utf-8", errors="ignore") as kf:
