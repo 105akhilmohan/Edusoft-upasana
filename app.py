@@ -1735,7 +1735,9 @@ def evaluate_papers():
 
         # Support multipart file upload if files/images/PDFs attached
         uploaded_student_files = []
+        uploaded_question_paper = None
         uploaded_answer_key = None
+        uploaded_combined_pdf = None
         if request.files:
             upload_dir = os.path.join(tempfile.gettempdir(), "evaluation_uploads")
             os.makedirs(upload_dir, exist_ok=True)
@@ -1745,14 +1747,35 @@ def evaluate_papers():
                         safe_filename = file_obj.filename
                         save_path = os.path.join(upload_dir, safe_filename)
                         file_obj.save(save_path)
-                        is_key = any(k in key.lower() or k in safe_filename.lower() for k in ["answer_key", "model_answer", "key"])
-                        if is_key:
+                        key_lower = key.lower()
+                        fname_lower = safe_filename.lower()
+
+                        is_qp = any(k in key_lower or k in fname_lower for k in [
+                            "question_paper", "questionpaper", "qp", "questions_file", "question_sheet", "exam_paper"
+                        ])
+                        is_key = any(k in key_lower or k in fname_lower for k in [
+                            "answer_key", "model_answer", "answerkey", "modelanswer", "marking_scheme", "rubric", "key"
+                        ])
+                        is_combined = any(k in key_lower or k in fname_lower for k in [
+                            "combined", "booklet", "entire_class", "class_pdf", "batch"
+                        ]) or (fname_lower.endswith(".pdf") and not is_qp and not is_key)
+
+                        if is_qp and not uploaded_question_paper:
+                            uploaded_question_paper = save_path
+                        elif is_key and not uploaded_answer_key:
                             uploaded_answer_key = save_path
+                        elif is_combined and not uploaded_combined_pdf:
+                            uploaded_combined_pdf = save_path
+                            uploaded_student_files.append({
+                                "file_name": safe_filename,
+                                "file_path": save_path,
+                                "file_type": "pdf"
+                            })
                         else:
                             uploaded_student_files.append({
                                 "file_name": safe_filename,
                                 "file_path": save_path,
-                                "file_type": "pdf" if safe_filename.lower().endswith(".pdf") else "jpg"
+                                "file_type": "pdf" if fname_lower.endswith(".pdf") else "jpg"
                             })
 
         payload = raw_body
@@ -1761,8 +1784,12 @@ def evaluate_papers():
         elif "payload" in raw_body and isinstance(raw_body["payload"], dict):
             payload = {**raw_body, **raw_body["payload"]}
 
+        if uploaded_question_paper and not payload.get("question_paper_file"):
+            payload["question_paper_file"] = uploaded_question_paper
         if uploaded_answer_key and not payload.get("answer_key_file"):
             payload["answer_key_file"] = uploaded_answer_key
+        if uploaded_combined_pdf and not payload.get("combined_pdf"):
+            payload["combined_pdf"] = uploaded_combined_pdf
 
         if uploaded_student_files:
             if not payload.get("students"):
@@ -1863,6 +1890,7 @@ def get_evaluation_by_id(evaluation_id):
     """
     Retrieve stored evaluation details and student marks by evaluation ID.
     Matches exact GET_RESPONSE specification.
+    Strictly removes student_name and student_id from returned student objects.
     """
     record = evaluation_store.get_evaluation(evaluation_id)
     if not record:
@@ -1870,6 +1898,13 @@ def get_evaluation_by_id(evaluation_id):
             "status": "error",
             "message": f"Evaluation #{evaluation_id} not found."
         }), 404
+    # Requirement 6: Guarantee student_name and student_id are removed from GET response
+    if isinstance(record, dict) and "data" in record and isinstance(record["data"], dict):
+        if "students" in record["data"] and isinstance(record["data"]["students"], list):
+            for s in record["data"]["students"]:
+                if isinstance(s, dict):
+                    s.pop("student_name", None)
+                    s.pop("student_id", None)
     return jsonify(record), 200
 
 
@@ -1878,6 +1913,7 @@ def get_evaluation_by_id(evaluation_id):
 def get_evaluation_breakdown(evaluation_id):
     """
     Retrieve full question-by-question step-marking breakdown for an evaluation.
+    Strictly removes student_name and student_id from returned student objects.
     """
     record = evaluation_store.get_post_evaluation(evaluation_id)
     if not record:
@@ -1885,7 +1921,13 @@ def get_evaluation_breakdown(evaluation_id):
             "status": "error",
             "message": f"Evaluation #{evaluation_id} not found."
         }), 404
-    return jsonify(record), 200
+    rec_copy = json.loads(json.dumps(record))
+    if isinstance(rec_copy, dict) and "students" in rec_copy and isinstance(rec_copy["students"], list):
+        for s in rec_copy["students"]:
+            if isinstance(s, dict):
+                s.pop("student_name", None)
+                s.pop("student_id", None)
+    return jsonify(rec_copy), 200
 
 
 @app.route("/api/evaluation/<evaluation_id>/student/<student_id>", methods=["GET"])
@@ -1893,6 +1935,7 @@ def get_evaluation_breakdown(evaluation_id):
 def get_student_evaluation_breakdown(evaluation_id, student_id):
     """
     Retrieve individual student's detailed evaluation sheet with step-marking breakdown.
+    Strictly removes student_name and student_id from returned student object.
     """
     student_eval = evaluation_store.get_student_evaluation(evaluation_id, student_id)
     if not student_eval:
@@ -1900,10 +1943,14 @@ def get_student_evaluation_breakdown(evaluation_id, student_id):
             "status": "error",
             "message": f"Student #{student_id} in evaluation #{evaluation_id} not found."
         }), 404
+    s_copy = json.loads(json.dumps(student_eval))
+    if isinstance(s_copy, dict):
+        s_copy.pop("student_name", None)
+        s_copy.pop("student_id", None)
     return jsonify({
         "status": "success",
         "evaluation_id": evaluation_id,
-        "student": student_eval
+        "student": s_copy
     }), 200
 
 
