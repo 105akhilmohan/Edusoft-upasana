@@ -401,12 +401,17 @@ def evaluate_student_submission_ai(
 
             resp_block = student_response_text if student_response_text else f"Answer sheet submitted across {page_count} page(s)."
 
+            known_name_desc = student_name if has_name else "Not provided - inspect document"
+            det_name_str = f'"{student_name}"' if has_name else "null"
+            rec_status_str = '"matched"' if has_name else '"unmatched"'
+            rec_conf_val = recognition_confidence if has_name else 0.0
+
             user_prompt = f"""
 Evaluate this examination submission:
 EXAMINATION DETAILS:
 - Subject: {subject_title}
 - Total Marks: {max_marks}
-- Known Student Name: {student_name if has_name else "Not provided - inspect document"}
+- Known Student Name: {known_name_desc}
 - Page Count: {page_count}
 
 QUESTIONS / ANSWER KEY:
@@ -417,10 +422,10 @@ STUDENT SUBMITTED RESPONSE / DOCUMENT:
 
 Return a single JSON object with this EXACT schema:
 {{
-  "detected_student_name": {"\"" + student_name + "\"" if has_name else "null"},
+  "detected_student_name": {det_name_str},
   "obtained_marks": <number>,
-  "recognition_status": {"\"matched\"" if has_name else "\"unmatched\""},
-  "recognition_confidence": {recognition_confidence if has_name else 0.0},
+  "recognition_status": {rec_status_str},
+  "recognition_confidence": {rec_conf_val},
   "ai_feedback": "<2-3 sentence diagnostic review of {subject_ref}'s performance>",
   "ai_insights": {{
     "recommendation": "<actionable recommendation tailored to {subject_ref}>",
