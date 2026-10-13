@@ -1078,6 +1078,11 @@ Return a single JSON object with this EXACT schema:
                     admission_no = str(parsed.get("detected_admission_no") or admission_no).strip()
                     roll_no = str(parsed.get("detected_roll_no") or roll_no).strip()
                     kuhs_reg_no = str(parsed.get("detected_kuhs_reg_no") or kuhs_reg_no).strip()
+                elif vision_images:
+                    detected_student_name = None
+                    admission_no = ""
+                    roll_no = ""
+                    kuhs_reg_no = ""
 
                 ai_id = parsed.get("detected_student_id")
                 if (
@@ -1086,6 +1091,8 @@ Return a single JSON object with this EXACT schema:
                     and str(ai_id).strip().lower() not in ("null", "none", "n/a", "student", "unknown", "unmatched")
                 ):
                     detected_student_id = str(ai_id).strip()
+                elif vision_images:
+                    detected_student_id = None
 
                 logger.info(f"OpenAI evaluation successful. Detected Name: {detected_student_name}, ID: {detected_student_id}")
         except Exception as e:
@@ -1368,7 +1375,20 @@ def process_paper_evaluation(
         if not subject_name:
             subject_name = parsed_title or "Curriculum Assessment"
 
-        # 3. Locate student answer document(s) / Combined PDF (Mode A)
+        # 3. Disregard incoming student identity sent by PHP backend; only retrieve identity written in PDF/image
+        IDENTITY_FIELDS = [
+            "student_name", "student_id", "name", "id", "admission_no", "adm_no",
+            "roll_no", "roll_number", "kuhs_reg_no", "reg_no", "registration_no",
+            "student_image", "recognized_text", "recognition_status", "recognition_confidence",
+            "ocr_text", "extracted_text"
+        ]
+        for f in IDENTITY_FIELDS:
+            payload.pop(f, None)
+            if "data" in payload and isinstance(payload["data"], dict):
+                payload["data"].pop(f, None)
+            if "payload" in payload and isinstance(payload["payload"], dict):
+                payload["payload"].pop(f, None)
+
         combined_pdf_path = (
             payload.get("combined_pdf")
             or payload.get("combined_file")
@@ -1379,7 +1399,12 @@ def process_paper_evaluation(
         students_raw = payload.get("students") or payload.get("answer_sheets") or payload.get("papers") or []
         if isinstance(students_raw, dict):
             students_raw = list(students_raw.values())
-        elif not isinstance(students_raw, list):
+        elif isinstance(students_raw, list):
+            for s in students_raw:
+                if isinstance(s, dict):
+                    for f in IDENTITY_FIELDS:
+                        s.pop(f, None)
+        else:
             students_raw = []
 
         if not combined_pdf_path:
@@ -1424,10 +1449,16 @@ def process_paper_evaluation(
                 f_path = s_data.get("file_path") or payload.get("file_path") or ""
                 f_name = s_data.get("file_name") or payload.get("file_name") or os.path.basename(f_path)
                 p_cnt = int(s_data.get("page_count") or payload.get("page_count") or 1)
+
+                resolved_f = resolve_file_location(f_path) if f_path else None
+                pdf_disk_text = ""
+                if resolved_f and resolved_f.lower().endswith(".pdf"):
+                    pdf_disk_text, _ = extract_text_from_pdf(resolved_f)
+
                 booklet_obj = {
                     "booklet_index": idx,
                     "page_numbers": list(range(1, p_cnt + 1)),
-                    "combined_text": s_data.get("ocr_text") or s_data.get("extracted_text") or ""
+                    "combined_text": pdf_disk_text
                 }
                 student_res = evaluate_student_booklet_ai(
                     booklet=booklet_obj,

@@ -1808,14 +1808,24 @@ def evaluate_papers():
                 "page_count": payload.get("page_count", 1)
             }]
 
-        # Strip any static or pre-filled student identity from incoming payload to ensure dynamic document detection only
-        for f in ["student_name", "student_id", "name", "id", "admission_no", "roll_no", "kuhs_reg_no", "student_image", "recognized_text", "recognition_status", "recognition_confidence"]:
+        # Disregard any incoming student identity sent by PHP backend; only retrieve identity written in PDF/image
+        IDENTITY_FIELDS = [
+            "student_name", "student_id", "name", "id", "admission_no", "adm_no",
+            "roll_no", "roll_number", "kuhs_reg_no", "reg_no", "registration_no",
+            "student_image", "recognized_text", "recognition_status", "recognition_confidence",
+            "ocr_text", "extracted_text"
+        ]
+        for f in IDENTITY_FIELDS:
             payload.pop(f, None)
+            if "data" in raw_body and isinstance(raw_body["data"], dict):
+                raw_body["data"].pop(f, None)
+            if "payload" in raw_body and isinstance(raw_body["payload"], dict):
+                raw_body["payload"].pop(f, None)
 
         if "students" in payload and isinstance(payload["students"], list):
             for s in payload["students"]:
                 if isinstance(s, dict):
-                    for f in ["student_name", "student_id", "name", "id", "admission_no", "roll_no", "kuhs_reg_no", "student_image", "recognized_text", "recognition_status", "recognition_confidence"]:
+                    for f in IDENTITY_FIELDS:
                         s.pop(f, None)
 
         if not payload or not isinstance(payload, dict):
@@ -1830,11 +1840,12 @@ def evaluate_papers():
             default_model=DEFAULT_MODEL
         )
 
-        # Safeguard: Strictly guarantee no static name is returned when unmatched on the document
+        # Safeguard: Strictly guarantee no static name from PHP is returned when unmatched on the document
         if isinstance(response_data, dict) and "students" in response_data and isinstance(response_data["students"], list):
             for s in response_data["students"]:
                 if isinstance(s, dict):
-                    if s.get("recognition_status") != "matched" or not s.get("student_name"):
+                    is_matched = (s.get("recognition_status") == "matched") and bool(s.get("student_name") or s.get("student_id"))
+                    if not is_matched:
                         s["student_name"] = ""
                         s["student_id"] = ""
                         s["admission_no"] = ""
@@ -1844,6 +1855,11 @@ def evaluate_papers():
                         s["recognized_text"] = ""
                         s["recognition_status"] = "unmatched"
                         s["recognition_confidence"] = 0.0
+                    else:
+                        if not s.get("student_name"):
+                            s["student_name"] = ""
+                        if not s.get("student_id"):
+                            s["student_id"] = ""
 
         return jsonify(response_data), status_code
 
