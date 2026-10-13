@@ -1781,6 +1781,16 @@ def evaluate_papers():
                 "page_count": payload.get("page_count", 1)
             }]
 
+        # Strip any static or pre-filled student identity from incoming payload to ensure dynamic document detection only
+        for f in ["student_name", "student_id", "name", "id", "admission_no", "roll_no", "kuhs_reg_no", "student_image", "recognized_text", "recognition_status", "recognition_confidence"]:
+            payload.pop(f, None)
+
+        if "students" in payload and isinstance(payload["students"], list):
+            for s in payload["students"]:
+                if isinstance(s, dict):
+                    for f in ["student_name", "student_id", "name", "id", "admission_no", "roll_no", "kuhs_reg_no", "student_image", "recognized_text", "recognition_status", "recognition_confidence"]:
+                        s.pop(f, None)
+
         if not payload or not isinstance(payload, dict):
             return jsonify({
                 "status": "error",
@@ -1792,6 +1802,22 @@ def evaluate_papers():
             client=client,
             default_model=DEFAULT_MODEL
         )
+
+        # Safeguard: Strictly guarantee no static name is returned when unmatched on the document
+        if isinstance(response_data, dict) and "students" in response_data and isinstance(response_data["students"], list):
+            for s in response_data["students"]:
+                if isinstance(s, dict):
+                    if s.get("recognition_status") != "matched" or not s.get("student_name"):
+                        s["student_name"] = ""
+                        s["student_id"] = ""
+                        s["admission_no"] = ""
+                        s["roll_no"] = ""
+                        s["kuhs_reg_no"] = ""
+                        s["student_image"] = ""
+                        s["recognized_text"] = ""
+                        s["recognition_status"] = "unmatched"
+                        s["recognition_confidence"] = 0.0
+
         return jsonify(response_data), status_code
 
     except OpenAIError as oe:
