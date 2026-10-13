@@ -335,7 +335,6 @@ class EvaluationStore:
             "post_response": post_resp,
             "get_response": get_resp
         }
-        self._save()
 
     def next_id(self) -> int:
         existing_numeric = [int(k) for k in self._cache.keys() if str(k).isdigit()]
@@ -364,6 +363,10 @@ def evaluate_student_submission_ai(
     Otherwise, do NOT show the name (student_name is empty and recognition_status is 'unmatched').
     Never use default or payload names if absent on the document.
     """
+    # Never use any default or passed student name from payload
+    student_data.pop("student_name", None)
+    student_data.pop("name", None)
+
     student_id = student_data.get("student_id") or student_data.get("id") or 1
     max_marks = float(exam_context.get("max_marks", 100.0))
     subject_title = exam_context.get("subject_name") or exam_context.get("title") or "Curriculum Assessment"
@@ -747,14 +750,20 @@ Return a single JSON object with this EXACT schema:
                 "feedback": f"Demonstrated clear comprehension in {subject_title}. Core principles and protocols were accurately addressed."
             })
 
-        sub_label = detected_student_name if has_name else "Student"
+        if has_name and detected_student_name:
+            fb_text = f"{detected_student_name} exhibited strong grasp of core theoretical concepts in {subject_title}. Evaluated across {page_count} uploaded answer page(s)."
+            rec_text = f"{detected_student_name} demonstrated strong understanding in {subject_title}. Maintain consistent terminology and documentation."
+        else:
+            fb_text = f"Evaluation reflects strong comprehension of core theoretical concepts in {subject_title}. Evaluated across {page_count} uploaded answer page(s)."
+            rec_text = f"Demonstrated consistent understanding in {subject_title}. Maintain consistent terminology and documentation."
+
         evaluated_result = {
             "obtained_marks": obtained_score,
             "recognition_status": recognition_status,
             "recognition_confidence": recognition_confidence,
-            "ai_feedback": f"{sub_label} exhibited strong grasp of core theoretical concepts in {subject_title}. Evaluated across {page_count} uploaded answer page(s).",
+            "ai_feedback": fb_text,
             "ai_insights": {
-                "recommendation": f"{sub_label} demonstrated strong understanding in {subject_title}. Maintain consistent terminology and documentation.",
+                "recommendation": rec_text,
                 "focus_areas": [
                     f"{subject_title} specialized analytical timelines",
                     "Documentation and dosage protocols"
