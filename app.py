@@ -1757,8 +1757,8 @@ def evaluate_papers():
                             "answer_key", "model_answer", "answerkey", "modelanswer", "marking_scheme", "rubric", "key"
                         ])
                         is_combined = any(k in key_lower or k in fname_lower for k in [
-                            "combined", "booklet", "entire_class", "class_pdf", "batch"
-                        ]) or (fname_lower.endswith(".pdf") and not is_qp and not is_key)
+                            "combined", "booklets", "entire_class", "class_pdf", "batch"
+                        ])
 
                         if is_qp and not uploaded_question_paper:
                             uploaded_question_paper = save_path

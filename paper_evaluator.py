@@ -158,28 +158,27 @@ def resolve_file_location(path_or_url: str) -> Optional[str]:
                     if os.path.isfile(found_path):
                         return os.path.abspath(found_path)
 
-    # 6. Try retrieving via HTTP from host web server if p is a relative path
-    clean_rel = p.lstrip("/\\").replace("\\", "/")
-    host_candidates = [
-        f"http://172.17.0.1/{clean_rel}",
-        f"http://localhost/{clean_rel}",
-        f"http://43.205.138.36/{clean_rel}",
-        f"http://172.17.0.1:80/{clean_rel}",
-    ]
-    for h_url in host_candidates:
-        try:
-            import urllib.request
-            req = urllib.request.Request(h_url, headers={"User-Agent": "EdusoftAI/1.0"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                if resp.status == 200:
-                    suffix = ".pdf" if ".pdf" in p.lower() else ".jpg"
-                    temp_f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                    temp_f.write(resp.read())
-                    temp_f.close()
-                    logger.info(f"Retrieved file via HTTP from {h_url} to {temp_f.name}")
-                    return temp_f.name
-        except Exception:
-            pass
+    # 6. Try retrieving via HTTP from host web server ONLY if path indicates upload location
+    if ("uploads" in p.lower() or p.startswith("http")) and not (p.startswith("http://") or p.startswith("https://")):
+        clean_rel = p.lstrip("/\\").replace("\\", "/")
+        host_candidates = [
+            f"http://172.17.0.1/{clean_rel}",
+            f"http://localhost/{clean_rel}",
+        ]
+        for h_url in host_candidates:
+            try:
+                import urllib.request
+                req = urllib.request.Request(h_url, headers={"User-Agent": "EdusoftAI/1.0"})
+                with urllib.request.urlopen(req, timeout=0.5) as resp:
+                    if resp.status == 200:
+                        suffix = ".pdf" if ".pdf" in p.lower() else ".jpg"
+                        temp_f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                        temp_f.write(resp.read())
+                        temp_f.close()
+                        logger.info(f"Retrieved file via HTTP from {h_url} to {temp_f.name}")
+                        return temp_f.name
+            except Exception:
+                pass
 
     return None
 
@@ -381,6 +380,29 @@ def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optio
     return detected_name, detected_id, detected_adm, detected_roll, detected_kuhs
 
 
+FORBIDDEN_PLACEHOLDER_SUBSTRINGS = [
+    "student response extracted and verified",
+    "handwritten answers on uploaded pages",
+    "response extracted across",
+    "answer extracted for question",
+    "refer to uploaded page",
+    "see handwritten sheet",
+    "verified response",
+    "placeholder",
+    "generic response",
+    "student response transcribed",
+    "handwritten response on page",
+]
+
+
+def contains_forbidden_placeholder(text: str) -> bool:
+    """Check if a response text contains forbidden generic placeholder phrasing."""
+    if not text or not isinstance(text, str):
+        return False
+    lower = text.lower().strip()
+    return any(p in lower for p in FORBIDDEN_PLACEHOLDER_SUBSTRINGS)
+
+
 def extract_qa_pairs_from_text(text: str) -> List[Dict[str, Any]]:
     """Parse question numbers and student responses from raw document text."""
     if not text:
@@ -413,7 +435,7 @@ def extract_qa_pairs_from_text(text: str) -> List[Dict[str, Any]]:
         qa_list.append({
             "question_no": q_num,
             "question_text": q_title,
-            "student_response": ans_text[:350] if ans_text else f"Answer extracted for Question {q_num}."
+            "student_response": ans_text[:500] if ans_text else ""
         })
     return qa_list
 
@@ -554,7 +576,7 @@ def detect_booklet_boundaries(
                 last_q_seen = 0
     else:
         # Vision-based boundary detection for scanned handwritten PDFs
-        if client and os.getenv("OPENAI_API_KEY"):
+        if client and (os.getenv("OPENAI_API_KEY") or hasattr(client, "chat")):
             try:
                 check_pages = min(total_pages, 25)
                 vision_samples = []
@@ -659,24 +681,29 @@ def parse_question_paper_and_answer_key(
     questions_list: List[Dict[str, Any]] = []
     detected_declared_marks: Optional[float] = declared_max_marks
 
+    logger.info(
+        f"Parsing examination documents: QP (text={len(qp_text)} chars, images={len(qp_images)}), "
+        f"AK (text={len(ak_text)} chars, images={len(ak_images)})"
+    )
+
     # 1. AI-Driven Authoritative Document Parsing if documents are available
-    if client and os.getenv("OPENAI_API_KEY") and (qp_text or qp_images or ak_text or ak_images):
+    if client and (os.getenv("OPENAI_API_KEY") or hasattr(client, "chat")) and (qp_text or qp_images or ak_text or ak_images):
         try:
             logger.info("Executing OpenAI parsing of Question Paper and Answer Key")
             system_prompt = (
                 "You are an authoritative examination document analysis engine for Edusoft.\n"
                 "Your objective is to independently parse the uploaded QUESTION PAPER and ANSWER KEY documents.\n"
-                "1. QUESTION PAPER is the authoritative source for question numbering (1, 2, 3...), question text, "
+                "1. QUESTION PAPER is the authoritative source for question numbering (1, 2, 3...), exact question text, "
                 "question type (Descriptive, Short Answer, Problem Solving, MCQ), and maximum marks for EACH question.\n"
-                "2. ANSWER KEY is the authoritative source for correct answers and scoring criteria/step rubrics.\n"
-                "3. Associate each question from the Question Paper with its corresponding model answer and criteria from the Answer Key.\n"
+                "2. ANSWER KEY is the authoritative source for correct model answers, acceptable alternatives, and scoring criteria/rubrics.\n"
+                "3. Associate each question from the Question Paper with its corresponding model answer and rubrics from the Answer Key.\n"
                 "4. Extract the declared total maximum marks and exam subject from the Question Paper header if present.\n"
-                "5. Do NOT hardcode or assume any fixed marks or question counts. Output strictly valid JSON."
+                "5. Do NOT hardcode, invent, or assume any fixed marks or question counts. Output strictly valid JSON."
             )
 
             prompt_text = (
-                f"QUESTION PAPER CONTENT:\n{qp_text if qp_text else '[Question paper image attached]'}\n\n"
-                f"ANSWER KEY / MODEL ANSWER CONTENT:\n{ak_text if ak_text else '[Answer key image attached]'}\n\n"
+                f"QUESTION PAPER CONTENT:\n{qp_text if qp_text else '[Question paper image(s) attached]'}\n\n"
+                f"ANSWER KEY / MODEL ANSWER CONTENT:\n{ak_text if ak_text else '[Answer key image(s) attached]'}\n\n"
                 f"PAYLOAD QUESTIONS (if provided):\n{json.dumps(payload_questions, indent=2) if payload_questions else 'None'}\n\n"
                 "Return a JSON object with this exact schema:\n"
                 "{\n"
@@ -698,14 +725,14 @@ def parse_question_paper_and_answer_key(
             )
 
             user_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
-            # Attach first 5 images of QP and first 5 images of AK
-            for name, img_bytes in qp_images[:5]:
+            # Attach up to 10 images of QP and up to 10 images of AK
+            for name, img_bytes in qp_images[:10]:
                 b64 = base64.b64encode(img_bytes).decode("utf-8")
                 user_content.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}
                 })
-            for name, img_bytes in ak_images[:5]:
+            for name, img_bytes in ak_images[:10]:
                 b64 = base64.b64encode(img_bytes).decode("utf-8")
                 user_content.append({
                     "type": "image_url",
@@ -735,7 +762,7 @@ def parse_question_paper_and_answer_key(
                 questions_list = ai_qs
                 logger.info(f"OpenAI successfully parsed {len(questions_list)} authoritative question(s) from QP & AK")
         except Exception as e:
-            logger.warning(f"OpenAI QP & AK parsing failed ({e}). Proceeding to algorithmic extraction.")
+            logger.warning(f"OpenAI QP & AK parsing failed ({e}). Proceeding to programmatic extraction.")
 
     # 2. Fallback to payload questions if AI parsing was empty
     if not questions_list and payload_questions and isinstance(payload_questions, list):
@@ -761,22 +788,56 @@ def parse_question_paper_and_answer_key(
                 "marking_criteria": q_rubric
             })
 
-    # 3. Fallback to algorithmic text extraction if still empty
+    # 3. Fallback to programmatic text extraction if still empty
     if not questions_list and (qp_text or ak_text):
-        source_text = qp_text or ak_text
-        extracted_qa = extract_qa_pairs_from_text(source_text)
-        if extracted_qa:
-            for item in extracted_qa:
+        parsed_qp_questions = extract_qa_pairs_from_text(qp_text) if qp_text else []
+        parsed_ak_answers = extract_qa_pairs_from_text(ak_text) if ak_text else []
+        ak_map = {a["question_no"]: a["student_response"] for a in parsed_ak_answers if a.get("student_response")}
+
+        if parsed_qp_questions:
+            for item in parsed_qp_questions:
+                q_no = item["question_no"]
+                q_title = item["question_text"]
+                # Extract max marks from question text if present, e.g., [5 Marks] or (10M)
+                marks_match = re.search(
+                    r"[\[\(](\d+(?:\.\d+)?)\s*(?:marks?|mks?|pts?|points?|m)[\]\)]",
+                    q_title,
+                    re.IGNORECASE
+                )
+                if marks_match:
+                    q_max = float(marks_match.group(1))
+                elif detected_declared_marks and len(parsed_qp_questions) > 0:
+                    q_max = round(detected_declared_marks / len(parsed_qp_questions), 1)
+                else:
+                    q_max = 10.0
+
+                model_ans = ak_map.get(q_no, "")
+                if not model_ans and ak_text and len(parsed_qp_questions) == 1:
+                    model_ans = ak_text[:500]
+
                 questions_list.append({
-                    "question_no": item["question_no"],
-                    "question_text": item["question_text"],
+                    "question_no": q_no,
+                    "question_text": q_title,
                     "question_type": "Descriptive",
-                    "max_marks": 10.0,
-                    "model_answer": item.get("student_response", ""),
+                    "max_marks": q_max,
+                    "model_answer": model_ans,
                     "marking_criteria": [
-                        {"step": f"Conceptual Accuracy for {item['question_text'][:30]}", "max_marks": 5.0},
-                        {"step": f"Application & Coherence for {item['question_text'][:30]}", "max_marks": 5.0}
-                    ]
+                        {"step": f"Core Criteria 1 for Question {q_no}", "max_marks": round(q_max * 0.5, 1)},
+                        {"step": f"Core Criteria 2 for Question {q_no}", "max_marks": max(0.5, round(q_max - round(q_max * 0.5, 1), 1))}
+                    ] if q_max > 0 else []
+                })
+        elif parsed_ak_answers and not qp_text:
+            for item in parsed_ak_answers:
+                q_no = item["question_no"]
+                q_title = item["question_text"]
+                q_max = 10.0
+                questions_list.append({
+                    "question_no": q_no,
+                    "question_text": q_title,
+                    "question_type": "Descriptive",
+                    "max_marks": q_max,
+                    "model_answer": item.get("student_response", ""),
+                    "marking_criteria": []
                 })
 
     # 4. Compute authoritative total marks & validate discrepancy
@@ -793,6 +854,11 @@ def parse_question_paper_and_answer_key(
 
     # Question paper is authoritative for total marks
     authoritative_total = sum_question_marks if sum_question_marks > 0 else (float(detected_declared_marks) if detected_declared_marks else 100.0)
+
+    logger.info(
+        f"QP/AK parsing finalized: {len(questions_list)} question(s), "
+        f"Authoritative Max Marks: {authoritative_total}, Discrepancy: {discrepancy_msg}"
+    )
 
     return questions_list, authoritative_total, discrepancy_msg, exam_title
 
@@ -843,11 +909,12 @@ class EvaluationStore:
         if not record:
             return None
         post_resp = record.get("post_response", {})
-        for s in post_resp.get("students", []):
+        for idx, s in enumerate(post_resp.get("students", []), start=1):
             if (
                 str(s.get("student_id")) == str(student_identifier)
                 or str(s.get("roll_no")) == str(student_identifier)
                 or str(s.get("id")) == str(student_identifier)
+                or str(idx) == str(student_identifier)
             ):
                 s_copy = json.loads(json.dumps(s))
                 # Return student identity ONLY when extracted from PDF/Image
@@ -958,36 +1025,39 @@ def evaluate_student_booklet_ai(
     ai_evaluated = False
     evaluated_result: Optional[Dict[str, Any]] = None
 
-    if client and os.getenv("OPENAI_API_KEY"):
-        try:
-            logger.info(f"Executing OpenAI Vision evaluation for booklet across {page_count} page(s)")
-            system_prompt = (
-                "You are an expert academic examination scoring engine for Edusoft.\n"
-                "Your objective is to evaluate a student's handwritten answer booklet against the Question Paper and Answer Key.\n\n"
-                "MANDATORY EVALUATION RULES:\n"
-                "1. EVALUATE HANDWRITTEN ANSWERS INDEPENDENTLY OF STUDENT IDENTITY:\n"
-                "   - Always fully transcribe and score all answers regardless of whether student name or ID is present.\n"
-                "   - NEVER withhold marks or return 0 obtained marks because identification details were not found!\n"
-                "   - If no student name or ID is written on the paper, return null for both, and set 'recognition_status': 'unmatched'.\n"
-                "   - Still return the full marks, question breakdown, and diagnostic feedback whenever answers can be assessed!\n\n"
-                "2. FOR EVERY QUESTION IN THE QUESTION PAPER:\n"
-                "   - Identify the question number and locate the corresponding handwritten answer across all booklet pages.\n"
-                "   - Determine if student ATTEMPTED the question:\n"
-                "     * is_attempted = true ONLY if there is a substantive handwritten response.\n"
-                "     * Blank space, page numbers, crossed-out text, or isolated question numbers with no answer are NOT attempted (is_attempted = false, obtained_marks = 0).\n"
-                "   - Evaluate attempted answers against the Answer Key and rubrics:\n"
-                "     * Accept semantically correct answers (different wording is acceptable; do NOT require exact text match).\n"
-                "     * Award partial marks with step marking based on conceptual correctness and depth.\n"
-                "     * Award zero marks ONLY when the answer is genuinely incorrect, blank, or completely irrelevant.\n"
-                "     * If handwriting is illegible or cannot be matched confidently, set pending_review = true, is_attempted = true, and explain why in feedback. Do NOT invent an answer or automatically award zero!\n"
-                "   - Transcribe the student's actual handwritten answer into 'student_response'.\n\n"
-                "3. STRICT IDENTITY EXTRACTION:\n"
-                "   - ONLY extract detected_student_name and detected_student_id if VISIBLY written on this booklet cover/header.\n"
-                "   - If not visibly written, return null for both. Never invent or use default names!\n\n"
-                "Output strictly valid JSON matching the schema."
-            )
+    if client and (os.getenv("OPENAI_API_KEY") or hasattr(client, "chat")):
+        system_prompt = (
+            "You are an expert academic examination scoring engine for Edusoft.\n"
+            "Your objective is to evaluate a student's handwritten answer booklet against the authoritative Question Paper and Answer Key.\n\n"
+            "CRITICAL RULES:\n"
+            "1. VERBATIM HANDWRITTEN TRANSCRIPTION:\n"
+            "   - For each question in the Question Paper, locate the student's handwritten response across all booklet pages (including multi-page continuations).\n"
+            "   - Transcribe the student's ACTUAL visible handwritten text, equations, calculations, and diagrams into 'student_response'.\n"
+            "   - NEVER use generic placeholders such as 'Student response extracted and verified', '[Handwritten answers on uploaded pages]', 'Response extracted across pages', etc. Generic placeholders are strictly prohibited.\n\n"
+            "2. ATTEMPT & READABILITY DETERMINATION:\n"
+            "   - If a question was skipped or blank: set is_attempted = false, pending_review = false, obtained_marks = 0.0, student_response = '[Unanswered]'.\n"
+            "   - If an answer is crossed out with no final response: set is_attempted = false, pending_review = false, obtained_marks = 0.0, student_response = '[Crossed out]'.\n"
+            "   - If handwriting is illegible, conflicting, or cannot be deciphered reliably: set is_attempted = true, pending_review = true, obtained_marks = 0.0, student_response = '[Illegible handwriting - Flagged for manual review]', and explain in 'feedback'. NEVER invent an answer or guess marks for illegible handwriting!\n"
+            "   - If substantive handwritten work is present and legible: set is_attempted = true, pending_review = false.\n\n"
+            "3. RUBRIC-BASED MARKING AGAINST ANSWER KEY:\n"
+            "   - Compare the student's transcribed answer with the model answer and marking rubrics from the Answer Key.\n"
+            "   - Assess factual correctness, conceptual understanding, formulas, steps, and required detail.\n"
+            "   - Accept semantically equivalent answers even if wording differs from the model answer.\n"
+            "   - Award partial credit with detailed step marking ONLY when the student's work demonstrates relevant correct knowledge.\n"
+            "   - Award zero marks if the answer is completely incorrect, irrelevant, or blank.\n"
+            "   - NEVER use fixed scoring factors (such as 65%, 70%, 75%, 80%) or award marks simply because text is present on the page.\n\n"
+            "4. ANSWER-SPECIFIC FEEDBACK:\n"
+            "   - 'feedback' for each question MUST cite the student's specific written statements, correct steps, and specific errors or missing concepts.\n"
+            "   - 'ai_feedback', 'ai_insights.recommendation', 'ai_insights.focus_areas', and 'ai_insights.strengths' MUST reflect the student's actual performance on these questions.\n"
+            "   - NEVER include unrelated comments about attendance, enrollment, fees, or administration.\n\n"
+            "5. INDEPENDENT IDENTITY EXTRACTION:\n"
+            "   - ONLY extract detected_student_name and detected_student_id if VISIBLY written on this booklet cover or header.\n"
+            "   - If not visibly written on the document, return null for both and set recognition_status = 'unmatched'.\n"
+            "   - Grade all readable answers fully regardless of whether student identity is detected!\n\n"
+            "Output strictly valid JSON matching the schema."
+        )
 
-            prompt_text = f"""
+        prompt_text = f"""
 EXAMINATION METRICS:
 - Subject: {subject_title}
 - Total Maximum Marks: {total_marks}
@@ -1027,204 +1097,227 @@ Return a single JSON object with this EXACT schema:
       "student_response": "<transcribed actual handwritten response>",
       "step_marking": [
         {{
-          "step": "<dynamic step specific to this question>",
+          "step": "<step criteria>",
           "max_marks": <number>,
           "obtained_marks": <number>,
           "status": "Full" or "Partial" or "Zero"
         }}
       ],
-      "feedback": "<question specific feedback>"
+      "feedback": "<question specific feedback citing student work>"
     }}
   ]
 }}
 """
-            user_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
-            for _, img_data, mime in vision_images:
-                b64_img = base64.b64encode(img_data).decode("utf-8")
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{b64_img}",
-                        "detail": "high"
-                    }
-                })
-
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.25
-            )
-            raw_content = completion.choices[0].message.content
-            parsed = json.loads(raw_content)
-
-            breakdown_list = parsed.get("evaluation_breakdown")
-            if breakdown_list and isinstance(breakdown_list, list) and len(breakdown_list) > 0:
-                evaluated_result = parsed
-                ai_evaluated = True
-
-                ai_name = parsed.get("detected_student_name")
-                if (
-                    ai_name
-                    and isinstance(ai_name, str)
-                    and ai_name.strip()
-                    and ai_name.strip().lower() not in ("null", "none", "n/a", "student", "unknown", "unmatched")
-                    and not any(w in ai_name.lower() for w in ["examination", "college", "university", "question", "subject"])
-                ):
-                    detected_student_name = ai_name.strip()
-                    admission_no = str(parsed.get("detected_admission_no") or admission_no).strip()
-                    roll_no = str(parsed.get("detected_roll_no") or roll_no).strip()
-                    kuhs_reg_no = str(parsed.get("detected_kuhs_reg_no") or kuhs_reg_no).strip()
-                elif vision_images:
-                    detected_student_name = None
-                    admission_no = ""
-                    roll_no = ""
-                    kuhs_reg_no = ""
-
-                ai_id = parsed.get("detected_student_id")
-                if (
-                    ai_id
-                    and str(ai_id).strip()
-                    and str(ai_id).strip().lower() not in ("null", "none", "n/a", "student", "unknown", "unmatched")
-                ):
-                    detected_student_id = str(ai_id).strip()
-                elif vision_images:
-                    detected_student_id = None
-
-                logger.info(f"OpenAI evaluation successful. Detected Name: {detected_student_name}, ID: {detected_student_id}")
-        except Exception as e:
-            logger.warning(f"OpenAI booklet evaluation failed: {e}. Executing algorithmic scoring.")
-
-    # Algorithmic Fallback if AI was unavailable
-    if not ai_evaluated or not evaluated_result:
-        parsed_qa = extract_qa_pairs_from_text(booklet_text)
-        generated_breakdown = []
-
-        q_list_to_use = questions if questions else []
-        if not q_list_to_use and parsed_qa:
-            for qa in parsed_qa:
-                q_list_to_use.append({
-                    "question_no": qa["question_no"],
-                    "question_text": qa["question_text"],
-                    "max_marks": round(total_marks / max(1, len(parsed_qa)), 1),
-                    "model_answer": f"Core principles for {qa['question_text']}"
-                })
-        elif not q_list_to_use:
-            for i in range(1, 4):
-                q_list_to_use.append({
-                    "question_no": i,
-                    "question_text": f"{subject_title} Question {i}",
-                    "max_marks": round(total_marks / 3, 1),
-                    "model_answer": f"Standard academic methodology for Section {i}"
-                })
-
-        for q_idx, q_item in enumerate(q_list_to_use, start=1):
-            q_num = q_item.get("question_no") or q_idx
-            q_txt = str(q_item.get("question_text") or f"Question {q_num}").strip()
-            q_max = float(q_item.get("max_marks") or round(total_marks / max(1, len(q_list_to_use)), 1))
-            q_key = str(q_item.get("model_answer") or q_item.get("answer_key") or f"Key concepts for {q_txt}").strip()
-
-            matched_ans = next((qa["student_response"] for qa in parsed_qa if qa["question_no"] == q_num), None)
-            if matched_ans:
-                resp_str = matched_ans
-                is_att = True
-                score_factor = 0.80 if len(resp_str) > 80 else 0.65
-                obt_m = round(q_max * score_factor, 1)
-            elif booklet_text:
-                resp_str = booklet_text[:200]
-                is_att = True
-                obt_m = round(q_max * 0.70, 1)
-            else:
-                resp_str = "[Handwritten answers on uploaded pages]"
-                is_att = True
-                obt_m = round(q_max * 0.75, 1)
-
-            s1_max = round(q_max * 0.5, 1)
-            s2_max = max(0.5, round(q_max - s1_max, 1))
-            s1_obt = round(s1_max * (obt_m / max(0.1, q_max)), 1)
-            s2_obt = max(0.0, round(obt_m - s1_obt, 1))
-
-            generated_breakdown.append({
-                "question_no": q_num,
-                "question_text": q_txt,
-                "question_type": "Descriptive",
-                "max_marks": q_max,
-                "obtained_marks": obt_m,
-                "is_attempted": is_att,
-                "pending_review": False,
-                "answer_key": q_key,
-                "student_response": resp_str,
-                "step_marking": [
-                    {
-                        "step": f"Conceptual Basis for {q_txt[:35]}",
-                        "max_marks": s1_max,
-                        "obtained_marks": s1_obt,
-                        "status": "Full" if s1_obt >= s1_max else "Partial"
-                    },
-                    {
-                        "step": f"Detailed Analysis for {q_txt[:35]}",
-                        "max_marks": s2_max,
-                        "obtained_marks": s2_obt,
-                        "status": "Full" if s2_obt >= s2_max else "Partial"
-                    }
-                ],
-                "feedback": f"Addressed core concepts for Question {q_num}. Relevant explanations provided."
+        user_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+        for _, img_data, mime in vision_images:
+            b64_img = base64.b64encode(img_data).decode("utf-8")
+            user_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{b64_img}",
+                    "detail": "high"
+                }
             })
 
-        evaluated_result = {
-            "ai_feedback": f"Evaluation completed across {page_count} page(s). Demonstrated understanding of {subject_title}.",
-            "ai_insights": {
-                "recommendation": f"Consistent responses in {subject_title}. Expand structured examples for maximum marks.",
-                "focus_areas": [f"{subject_title} Technical Definitions", f"{subject_title} Methodological Depth"],
-                "strengths": [f"Clear grasp of {subject_title} fundamentals", "Logical step-by-step presentation"]
-            },
-            "evaluation_breakdown": generated_breakdown
-        }
+        max_vision_retries = 2
+        for attempt in range(max_vision_retries + 1):
+            try:
+                logger.info(f"OpenAI Vision evaluation attempt {attempt + 1}/{max_vision_retries + 1} for booklet across {page_count} page(s)")
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.2
+                )
+                raw_content = completion.choices[0].message.content
+                parsed = json.loads(raw_content)
 
-    # Normalize question breakdown & calculate exact metrics
-    raw_breakdown = evaluated_result.get("evaluation_breakdown") or []
+                breakdown_list = parsed.get("evaluation_breakdown")
+                if breakdown_list and isinstance(breakdown_list, list) and len(breakdown_list) > 0:
+                    evaluated_result = parsed
+                    ai_evaluated = True
+
+                    ai_name = parsed.get("detected_student_name")
+                    if (
+                        ai_name
+                        and isinstance(ai_name, str)
+                        and ai_name.strip()
+                        and ai_name.strip().lower() not in ("null", "none", "n/a", "student", "unknown", "unmatched")
+                        and not any(w in ai_name.lower() for w in ["examination", "college", "university", "question", "subject"])
+                    ):
+                        detected_student_name = ai_name.strip()
+                        admission_no = str(parsed.get("detected_admission_no") or admission_no).strip()
+                        roll_no = str(parsed.get("detected_roll_no") or roll_no).strip()
+                        kuhs_reg_no = str(parsed.get("detected_kuhs_reg_no") or kuhs_reg_no).strip()
+                    elif vision_images:
+                        detected_student_name = None
+                        admission_no = ""
+                        roll_no = ""
+                        kuhs_reg_no = ""
+
+                    ai_id = parsed.get("detected_student_id")
+                    if (
+                        ai_id
+                        and str(ai_id).strip()
+                        and str(ai_id).strip().lower() not in ("null", "none", "n/a", "student", "unknown", "unmatched")
+                    ):
+                        detected_student_id = str(ai_id).strip()
+                    elif vision_images:
+                        detected_student_id = None
+
+                    logger.info(f"OpenAI evaluation successful. Detected Name: {detected_student_name}, ID: {detected_student_id}")
+                    break
+                else:
+                    logger.warning(f"OpenAI returned empty evaluation breakdown on attempt {attempt + 1}")
+            except Exception as e:
+                logger.warning(f"OpenAI vision attempt {attempt + 1} failed: {e}")
+                if attempt < max_vision_retries:
+                    import time
+                    time.sleep(1.0)
+                else:
+                    logger.error(f"All OpenAI Vision evaluation attempts failed for booklet: {e}")
+
+    # Process evaluation breakdown strictly without fabricating marks
     normalized_breakdown: List[Dict[str, Any]] = []
 
-    # Ensure all authoritative questions are represented
-    if questions:
+    if ai_evaluated and evaluated_result:
+        raw_breakdown = evaluated_result.get("evaluation_breakdown") or []
         breakdown_by_qno = {q.get("question_no"): q for q in raw_breakdown if isinstance(q, dict)}
+
         for q_item in questions:
             q_num = q_item.get("question_no")
+            q_max = float(q_item.get("max_marks", 10.0))
+            q_txt = q_item.get("question_text", f"Question {q_num}")
+            q_key = q_item.get("model_answer") or q_item.get("answer_key", "")
+
             if q_num in breakdown_by_qno:
                 b_item = breakdown_by_qno[q_num]
-                # Keep authoritative max_marks
-                b_item["max_marks"] = float(q_item.get("max_marks", b_item.get("max_marks", 10.0)))
-                # Enforce obtained_marks <= max_marks
-                b_item["obtained_marks"] = min(float(b_item.get("obtained_marks", 0.0)), b_item["max_marks"])
+                b_item["question_text"] = q_txt
+                b_item["max_marks"] = q_max
+                b_item["answer_key"] = q_key or b_item.get("answer_key", "")
+
+                student_resp = str(b_item.get("student_response", "")).strip()
+
+                # Strictly reject forbidden generic placeholders
+                if contains_forbidden_placeholder(student_resp):
+                    logger.warning(f"Question {q_num} response contained forbidden placeholder: '{student_resp}'. Flagging for manual review.")
+                    b_item["is_attempted"] = True
+                    b_item["pending_review"] = True
+                    b_item["obtained_marks"] = 0.0
+                    b_item["student_response"] = "[Unverified transcription - Flagged for manual review]"
+                    b_item["feedback"] = "Automated model output contained generic placeholder text instead of verified transcription. Flagged for manual review."
+                elif b_item.get("pending_review"):
+                    # Questions flagged for review cannot have fabricated marks
+                    b_item["obtained_marks"] = 0.0
+                    b_item["is_attempted"] = True
+                    if not student_resp:
+                        b_item["student_response"] = "[Illegible handwriting - Flagged for manual review]"
+                elif not b_item.get("is_attempted"):
+                    b_item["obtained_marks"] = 0.0
+                    b_item["pending_review"] = False
+                    b_item["student_response"] = student_resp if student_resp in ["[Crossed out]", "[Unanswered]"] else "[Unanswered]"
+                    b_item["feedback"] = b_item.get("feedback") or f"Question {q_num} was not attempted by the student."
+                else:
+                    # Legitimate evaluated answer: validate marks bounds
+                    raw_obt = float(b_item.get("obtained_marks", 0.0))
+                    b_item["obtained_marks"] = max(0.0, min(round(raw_obt, 1), q_max))
+                    b_item["pending_review"] = False
+
+                # Validate step marking
+                steps = b_item.get("step_marking") or []
+                if b_item.get("pending_review") or not b_item.get("is_attempted"):
+                    b_item["step_marking"] = [
+                        {
+                            "step": "Manual Verification Required" if b_item.get("pending_review") else "Question attempted",
+                            "max_marks": q_max,
+                            "obtained_marks": 0.0,
+                            "status": "Zero"
+                        }
+                    ]
+                elif steps:
+                    validated_steps = []
+                    for st in steps:
+                        st_max = float(st.get("max_marks", 0.0))
+                        st_obt = max(0.0, min(float(st.get("obtained_marks", 0.0)), st_max))
+                        st_status = "Full" if (st_obt >= st_max and st_max > 0) else ("Partial" if st_obt > 0 else "Zero")
+                        validated_steps.append({
+                            "step": str(st.get("step", "Criteria")).strip(),
+                            "max_marks": round(st_max, 1),
+                            "obtained_marks": round(st_obt, 1),
+                            "status": st_status
+                        })
+                    b_item["step_marking"] = validated_steps
+
+                logger.info(
+                    f"Question {q_num}: attempted={b_item.get('is_attempted')}, "
+                    f"marks={b_item.get('obtained_marks')}/{q_max}, "
+                    f"pending_review={b_item.get('pending_review')}"
+                )
                 normalized_breakdown.append(b_item)
             else:
-                # Student did not attempt this question
-                q_max = float(q_item.get("max_marks", 10.0))
+                # Question not located in model breakdown
+                is_substantive = bool(vision_images or booklet_text)
+                logger.warning(f"Question {q_num} was omitted from AI breakdown. Flagging for review: substantive={is_substantive}")
                 normalized_breakdown.append({
                     "question_no": q_num,
-                    "question_text": q_item.get("question_text", f"Question {q_num}"),
+                    "question_text": q_txt,
                     "question_type": q_item.get("question_type", "Descriptive"),
                     "max_marks": q_max,
                     "obtained_marks": 0.0,
-                    "is_attempted": False,
-                    "pending_review": False,
-                    "answer_key": q_item.get("model_answer", ""),
-                    "student_response": "[Unanswered]",
+                    "is_attempted": is_substantive,
+                    "pending_review": is_substantive,
+                    "answer_key": q_key,
+                    "student_response": "[Not located in automated evaluation - Flagged for manual review]" if is_substantive else "[Unanswered]",
                     "step_marking": [
                         {
-                            "step": "Question attempted",
+                            "step": "Manual Verification Required" if is_substantive else "Question attempted",
                             "max_marks": q_max,
                             "obtained_marks": 0.0,
                             "status": "Zero"
                         }
                     ],
-                    "feedback": f"Question {q_num} was not attempted by the student."
+                    "feedback": f"Question {q_num} could not be located in automated vision evaluation. Flagged for manual review." if is_substantive else f"Question {q_num} was not attempted by the student."
                 })
     else:
-        normalized_breakdown = raw_breakdown
+        # AI evaluation was unavailable or completely failed: DO NOT INVENT MARKS OR FALLBACK MULTIPLIERS!
+        logger.warning(f"AI evaluation unavailable or failed for booklet. Flagging all {len(questions)} question(s) for manual review.")
+        has_content = bool(vision_images or booklet_text)
+        for q_item in questions:
+            q_num = q_item.get("question_no")
+            q_max = float(q_item.get("max_marks", 10.0))
+            normalized_breakdown.append({
+                "question_no": q_num,
+                "question_text": q_item.get("question_text", f"Question {q_num}"),
+                "question_type": q_item.get("question_type", "Descriptive"),
+                "max_marks": q_max,
+                "obtained_marks": 0.0,
+                "is_attempted": has_content,
+                "pending_review": True,
+                "answer_key": q_item.get("model_answer") or q_item.get("answer_key", ""),
+                "student_response": "[Automated evaluation unavailable - Flagged for manual review]",
+                "step_marking": [
+                    {
+                        "step": "Manual Verification Required",
+                        "max_marks": q_max,
+                        "obtained_marks": 0.0,
+                        "status": "Zero"
+                    }
+                ],
+                "feedback": f"Automated AI evaluation could not process Question {q_num}. Flagged for manual instructor review."
+            })
+
+        evaluated_result = {
+            "ai_feedback": f"Automated evaluation could not reliably process this answer booklet. All {len(questions)} question(s) have been flagged for manual instructor review.",
+            "ai_insights": {
+                "recommendation": "Manual instructor review required.",
+                "focus_areas": [],
+                "strengths": []
+            },
+            "evaluation_breakdown": normalized_breakdown
+        }
 
     # Precise Metric Calculations
     total_q_count = len(normalized_breakdown)
@@ -1239,8 +1332,21 @@ Return a single JSON object with this EXACT schema:
 
     summed_obtained = round(sum(float(q.get("obtained_marks", 0.0)) for q in normalized_breakdown), 1)
     percentage_score = round((summed_obtained / authoritative_max) * 100.0, 2) if authoritative_max > 0 else 0.0
-    grade_score = calculate_grade(percentage_score)
-    status_score = determine_status(percentage_score)
+
+    # Derive grade and pass/fail status
+    if pending_review_q_count > 0 and evaluated_q_count == 0:
+        grade_score = "Pending"
+        status_score = "Pending Review"
+    else:
+        grade_score = calculate_grade(percentage_score)
+        status_score = determine_status(percentage_score)
+
+    logger.info(
+        f"Booklet {booklet.get('booklet_index', 1)} evaluation complete: "
+        f"Score={summed_obtained}/{authoritative_max} ({percentage_score}%), "
+        f"Grade={grade_score}, Status={status_score}, Evaluated={evaluated_q_count}, "
+        f"Pending={pending_review_q_count}, Unanswered={unanswered_q_count}"
+    )
 
     # STRICT IDENTITY ENFORCEMENT FOR POST RESPONSE:
     has_name = bool(detected_student_name and str(detected_student_name).strip())
@@ -1256,7 +1362,6 @@ Return a single JSON object with this EXACT schema:
         rec_conf = 98.5
         recognized_text_str = f"Recognized: {final_student_name}" + (f" (ID: {final_student_id})" if final_student_id else "")
     else:
-        # Zero-marks bug fix: Unmatched identity MUST return empty fields, but NEVER zero out marks
         final_student_name = ""
         final_student_id = ""
         admission_no = ""
@@ -1279,6 +1384,7 @@ Return a single JSON object with this EXACT schema:
     ]
 
     return {
+        "id": booklet.get("booklet_index", 1),
         "student_id": final_student_id,
         "student_name": final_student_name,
         "admission_no": admission_no,
@@ -1363,6 +1469,48 @@ def process_paper_evaluation(
         declared_total = payload.get("max_marks") or payload.get("total_marks")
         declared_total_float = float(declared_total) if declared_total is not None else None
 
+        # Validate Question Paper input
+        has_qp_doc = bool(qp_source and str(qp_source).strip())
+        has_payload_qs = bool(payload_questions and isinstance(payload_questions, list) and len(payload_questions) > 0)
+        if not has_qp_doc and not has_payload_qs:
+            logger.error("Paper evaluation failed: Question paper is missing.")
+            return {
+                "status": "error",
+                "status_code": 400,
+                "message": "Question paper is missing. Please provide the authoritative question paper document or questions list."
+            }, 400
+
+        resolved_qp = resolve_file_location(qp_source) if has_qp_doc else None
+        if has_qp_doc and isinstance(qp_source, str) and not resolved_qp and not has_payload_qs:
+            if any(ext in qp_source.lower() for ext in [".pdf", ".jpg", ".jpeg", ".png"]):
+                logger.error(f"Paper evaluation failed: Question paper file could not be found: {qp_source}")
+                return {
+                    "status": "error",
+                    "status_code": 400,
+                    "message": f"Question paper file could not be resolved or found: {qp_source}"
+                }, 400
+
+        # Validate Answer Key input
+        has_ak_doc = bool(ak_source and str(ak_source).strip())
+        has_payload_answers = bool(has_payload_qs and any(q.get("answer_key") or q.get("model_answer") for q in payload_questions if isinstance(q, dict)))
+        if not has_ak_doc and not has_payload_answers:
+            logger.error("Paper evaluation failed: Answer key is missing.")
+            return {
+                "status": "error",
+                "status_code": 400,
+                "message": "Answer key is missing. Please provide the authoritative answer key document or model answers in the questions list."
+            }, 400
+
+        resolved_ak = resolve_file_location(ak_source) if has_ak_doc else None
+        if has_ak_doc and isinstance(ak_source, str) and not resolved_ak and not has_payload_answers:
+            if any(ext in ak_source.lower() for ext in [".pdf", ".jpg", ".jpeg", ".png"]):
+                logger.error(f"Paper evaluation failed: Answer key file could not be found: {ak_source}")
+                return {
+                    "status": "error",
+                    "status_code": 400,
+                    "message": f"Answer key file could not be resolved or found: {ak_source}"
+                }, 400
+
         # 2. Parse authoritative Question Paper and Answer Key
         authoritative_questions, max_marks, discrepancy, parsed_title = parse_question_paper_and_answer_key(
             qp_source=qp_source,
@@ -1372,6 +1520,14 @@ def process_paper_evaluation(
             client=client,
             model=model
         )
+        if not authoritative_questions:
+            logger.error("Paper evaluation failed: Could not extract authoritative questions.")
+            return {
+                "status": "error",
+                "status_code": 400,
+                "message": "Could not extract authoritative questions from the question paper. Please verify the document is readable and contains valid questions."
+            }, 400
+
         if not subject_name:
             subject_name = parsed_title or "Curriculum Assessment"
 
@@ -1407,19 +1563,53 @@ def process_paper_evaluation(
         else:
             students_raw = []
 
+        # Prevent confusing Question Paper or Answer Key with Student Answer Sheets
+        exam_doc_paths = {p for p in [resolved_qp, resolved_ak] if p}
+
+        valid_students_raw = []
+        for s in students_raw:
+            if isinstance(s, dict):
+                s_fp = resolve_file_location(s.get("file_path", ""))
+                if s_fp and s_fp in exam_doc_paths:
+                    logger.warning(f"Excluding student sheet candidate matching exam document: {s_fp}")
+                    continue
+                valid_students_raw.append(s)
+
+        resolved_combined = resolve_file_location(combined_pdf_path) if combined_pdf_path else None
+        if resolved_combined and resolved_combined in exam_doc_paths:
+            logger.warning(f"Combined PDF path matched QP/AK ({resolved_combined}). Removing from student booklets.")
+            combined_pdf_path = None
+            resolved_combined = None
+
         if not combined_pdf_path:
-            if payload.get("file_path") and str(payload["file_path"]).lower().endswith(".pdf"):
-                combined_pdf_path = payload["file_path"]
-            elif students_raw:
-                first_item = students_raw[0]
-                if isinstance(first_item, dict) and first_item.get("file_path"):
-                    if str(first_item["file_path"]).lower().endswith(".pdf"):
-                        combined_pdf_path = first_item["file_path"]
+            if len(valid_students_raw) == 1:
+                first_fp = valid_students_raw[0].get("file_path")
+                if first_fp and str(first_fp).lower().endswith(".pdf"):
+                    combined_pdf_path = first_fp
+            elif payload.get("file_path") and str(payload["file_path"]).lower().endswith(".pdf"):
+                fp_res = resolve_file_location(payload["file_path"])
+                if fp_res not in exam_doc_paths:
+                    combined_pdf_path = payload["file_path"]
+
+        # Validate that student answer sheet is provided
+        has_student_input = bool(
+            combined_pdf_path
+            or valid_students_raw
+            or (payload.get("file_path") and resolve_file_location(payload["file_path"]) not in exam_doc_paths)
+            or payload.get("file_name")
+        )
+        if not has_student_input:
+            logger.error("Paper evaluation failed: Student answer sheet is missing or could not be resolved.")
+            return {
+                "status": "error",
+                "status_code": 400,
+                "message": "Student answer sheet is missing or could not be resolved."
+            }, 400
 
         evaluated_students: List[Dict[str, Any]] = []
 
         # 4. Mode A Evaluation: Combined PDF with boundary detection
-        if combined_pdf_path:
+        if combined_pdf_path and len(valid_students_raw) <= 1:
             resolved_pdf = resolve_file_location(combined_pdf_path)
             if resolved_pdf and os.path.exists(resolved_pdf):
                 logger.info(f"Executing Mode A Class-Wise Evaluation on combined PDF: {resolved_pdf}")
@@ -1428,7 +1618,7 @@ def process_paper_evaluation(
                     client=client,
                     model=model
                 )
-                for b in detected_booklets:
+                for idx, b in enumerate(detected_booklets, start=1):
                     student_res = evaluate_student_booklet_ai(
                         booklet=b,
                         file_path=resolved_pdf,
@@ -1440,11 +1630,12 @@ def process_paper_evaluation(
                         client=client,
                         model=model
                     )
+                    student_res["id"] = idx
                     evaluated_students.append(student_res)
 
-        # Fallback: Evaluate individual sheets if no combined PDF or boundary detection yielded empty
+        # Mode B / Multiple individual files:
         if not evaluated_students:
-            target_list = students_raw if students_raw else [payload]
+            target_list = valid_students_raw if valid_students_raw else [payload]
             for idx, s_data in enumerate(target_list, start=1):
                 f_path = s_data.get("file_path") or payload.get("file_path") or ""
                 f_name = s_data.get("file_name") or payload.get("file_name") or os.path.basename(f_path)
@@ -1458,7 +1649,8 @@ def process_paper_evaluation(
                 booklet_obj = {
                     "booklet_index": idx,
                     "page_numbers": list(range(1, p_cnt + 1)),
-                    "combined_text": pdf_disk_text
+                    "combined_text": pdf_disk_text,
+                    "pages": s_data.get("pages") or []
                 }
                 student_res = evaluate_student_booklet_ai(
                     booklet=booklet_obj,
@@ -1471,6 +1663,7 @@ def process_paper_evaluation(
                     client=client,
                     model=model
                 )
+                student_res["id"] = idx
                 evaluated_students.append(student_res)
 
         if not evaluated_students:
@@ -1497,6 +1690,10 @@ def process_paper_evaluation(
             "discrepancy": discrepancy,
             "students": evaluated_students
         }
+        if qp_source and isinstance(qp_source, str):
+            post_response["question_paper_file"] = qp_source
+        if ak_source and isinstance(ak_source, str):
+            post_response["answer_key_file"] = ak_source
         if payload.get("include_evaluation_id") or payload.get("include_id"):
             post_response["evaluation_id"] = int(eval_id) if eval_id.isdigit() else eval_id
 
@@ -1565,6 +1762,10 @@ def process_paper_evaluation(
                 "students": get_students_list
             }
         }
+        if qp_source and isinstance(qp_source, str):
+            get_response["data"]["question_paper_file"] = qp_source
+        if ak_source and isinstance(ak_source, str):
+            get_response["data"]["answer_key_file"] = ak_source
 
         # 7. Persist to EvaluationStore
         evaluation_store.save_evaluation(eval_id=eval_id, post_resp=post_response, get_resp=get_response)
