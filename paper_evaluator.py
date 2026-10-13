@@ -380,11 +380,18 @@ def evaluate_student_submission_ai(
     Otherwise, do NOT show the name (student_name is empty and recognition_status is 'unmatched').
     Never use default or payload names if absent on the document.
     """
-    # Never use any default or passed student name or student ID from payload
+    # Never use any default or passed student details from payload
     student_data.pop("student_name", None)
     student_data.pop("name", None)
     student_data.pop("student_id", None)
     student_data.pop("id", None)
+    student_data.pop("admission_no", None)
+    student_data.pop("roll_no", None)
+    student_data.pop("kuhs_reg_no", None)
+    student_data.pop("student_image", None)
+    student_data.pop("recognized_text", None)
+    student_data.pop("recognition_status", None)
+    student_data.pop("recognition_confidence", None)
 
     max_marks = float(exam_context.get("max_marks", 100.0))
     subject_title = exam_context.get("subject_name") or exam_context.get("title") or "Curriculum Assessment"
@@ -472,6 +479,11 @@ def evaluate_student_submission_ai(
                 "You are an expert academic examination scoring engine for Edusoft.\n"
                 "Your objective is to evaluate the student's uploaded answer paper (PDF text or scanned images) "
                 "against the question paper and model answer key.\n\n"
+                "CRITICAL MANDATORY INSTRUCTION:\n"
+                "1. YOU MUST ALWAYS FULLY TRANSCRIBE AND EVALUATE ALL QUESTIONS AND ANSWERS ON THE PAPER, EVEN IF NO STUDENT NAME OR ID IS FOUND!\n"
+                "2. NEVER refuse, halt, or skip evaluation due to missing student identification!\n"
+                "3. Carefully read all handwritten answers on the page(s), identify every question, score each question with full step markings ('step', 'max_marks', 'obtained_marks', 'status'), and compute fair marks and grades.\n"
+                "4. If the paper has no name or ID, simply set 'detected_student_name': null and 'detected_student_id': null, but STILL COMPLETE THE FULL QUESTION EVALUATION!\n\n"
                 "STRICT IDENTITY EXTRACTION RULES:\n"
                 "1. Inspect the uploaded document/image carefully for the student's name and student ID written on the paper (check cover page or top header).\n"
                 "2. ONLY if a real student name is visibly written/printed ON THE PAPER, extract it into 'detected_student_name'. If NO student name is on the paper, return null.\n"
@@ -569,7 +581,7 @@ Return a single JSON object with this EXACT schema:
             raw_content = completion.choices[0].message.content
             parsed = json.loads(raw_content)
 
-            if "evaluation_breakdown" in parsed:
+            if "evaluation_breakdown" in parsed and parsed.get("evaluation_breakdown"):
                 evaluated_result = parsed
                 ai_evaluated = True
 
@@ -818,8 +830,8 @@ Return a single JSON object with this EXACT schema:
     # Normalize metrics
     obtained_val = float(evaluated_result.get("obtained_marks", 0.0))
     percentage_val = round((obtained_val / max_marks) * 100.0, 2)
-    grade_val = student_data.get("grade") or calculate_grade(percentage_val)
-    status_val = student_data.get("status") or determine_status(percentage_val)
+    grade_val = calculate_grade(percentage_val)
+    status_val = determine_status(percentage_val)
 
     # STRICT CHECK: Only pass student_name and student_id if detected on the document itself
     final_student_name = detected_student_name if (has_name and detected_student_name) else ""
@@ -835,6 +847,15 @@ Return a single JSON object with this EXACT schema:
     final_kuhs = kuhs_reg_no if (has_name or has_id) else ""
     final_img = student_image if (has_name or has_id) else ""
 
+    if has_name and detected_student_name:
+        recognized_text_str = f"Recognized Student: {detected_student_name}"
+        if detected_student_id:
+            recognized_text_str += f" | ID: {detected_student_id}"
+    elif has_id and detected_student_id:
+        recognized_text_str = f"Student ID: {detected_student_id}"
+    else:
+        recognized_text_str = ""
+
     logger.info(f"Evaluation finished for sheet: Name detected={final_student_name or 'None'}, ID detected={final_student_id or 'None'}, Status={recognition_status}, Marks={obtained_val}/{max_marks}")
 
     return {
@@ -844,6 +865,7 @@ Return a single JSON object with this EXACT schema:
         "roll_no": final_roll,
         "kuhs_reg_no": final_kuhs,
         "student_image": final_img,
+        "recognized_text": recognized_text_str,
         "file_name": file_name,
         "file_path": file_path,
         "file_type": file_type,
@@ -975,19 +997,20 @@ def process_paper_evaluation(
         get_students_list = []
         for idx, s in enumerate(evaluated_students, start=1):
             insights_compact = {
-                "recommendation": s["ai_insights"].get("recommendation", f"Student demonstrated proficiency in {subject_name}."),
+                "recommendation": s["ai_insights"].get("recommendation", f"Demonstrated proficiency in {subject_name}."),
                 "focus_areas": s["ai_insights"].get("focus_areas", [])
             }
             record_id = s.get("id") or (idx)
             get_students_list.append({
                 "id": str(record_id),
                 "evaluation_id": str(eval_id),
-                "student_id": str(s["student_id"]) if s.get("student_id") is not None else "",
+                "student_id": str(s["student_id"]) if s.get("student_id") else "",
                 "student_name": s["student_name"] if s.get("student_name") else "",
                 "admission_no": s["admission_no"] if s.get("admission_no") else "",
                 "roll_no": str(s["roll_no"]) if s.get("roll_no") else "",
                 "kuhs_reg_no": str(s.get("kuhs_reg_no", "")) if s.get("kuhs_reg_no") else "",
                 "student_image": s.get("student_image", "") if s.get("student_image") else "",
+                "recognized_text": s.get("recognized_text", ""),
                 "file_name": s.get("file_name", ""),
                 "file_path": s.get("file_path", ""),
                 "total_marks": format_two_decimals(s["total_marks"]),
