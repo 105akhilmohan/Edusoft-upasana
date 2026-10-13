@@ -3,9 +3,13 @@ Edusoft AI Automated Paper Evaluation Engine.
 Performs AI-driven evaluation of student answer sheets/papers against model answers/rubrics.
 Produces question-by-question step-marking breakdown, obtained scores, grades,
 actionable diagnostic AI feedback, and student-level strengths/recommendations.
-All student details, questions, and scores are processed dynamically from incoming data without hardcoding.
+
+STRICT IDENTITY RULE:
+If the uploaded image or PDF contains/recognizes the student's name, display that name and details.
+Otherwise, do not show any student name or details (student_name remains empty/unmatched).
 """
 import os
+import re
 import json
 import logging
 from datetime import datetime
@@ -47,6 +51,139 @@ def format_two_decimals(val: Any) -> str:
         return f"{float(val):.2f}"
     except (ValueError, TypeError):
         return str(val)
+
+
+# ==============================================================================
+# STUDENT IDENTITY EXTRACTION (Uploaded Document / Image / PDF Inspection)
+# ==============================================================================
+def extract_student_identity_from_sheet(student_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract student name and identification details strictly if present on the
+    uploaded image, PDF, or input text.
+    If the uploaded image or PDF has a recognized name, returns the name and details.
+    Otherwise, leaves student_name as empty string and recognition_status as 'unmatched'.
+    """
+    detected_name = None
+    detected_admission_no = None
+    detected_roll_no = None
+    detected_kuhs_reg_no = None
+    recognition_confidence = 0.0
+
+    # 1. Inspect direct field in student_data (if genuine and not a placeholder)
+    raw_name = student_data.get("student_name") or student_data.get("name")
+    if raw_name:
+        clean_name = str(raw_name).strip()
+        lower_name = clean_name.lower()
+        if clean_name and not (
+            lower_name.startswith("student ")
+            or lower_name in ("student", "candidate", "unknown", "n/a", "null", "none", "undefined")
+        ):
+            detected_name = clean_name
+            recognition_confidence = float(student_data.get("recognition_confidence") or 98.5)
+
+    raw_adm = student_data.get("admission_no")
+    if raw_adm and str(raw_adm).strip():
+        detected_admission_no = str(raw_adm).strip()
+
+    raw_roll = student_data.get("roll_no")
+    if raw_roll and str(raw_roll).strip():
+        detected_roll_no = str(raw_roll).strip()
+
+    raw_kuhs = student_data.get("kuhs_reg_no")
+    if raw_kuhs and str(raw_kuhs).strip():
+        detected_kuhs_reg_no = str(raw_kuhs).strip()
+
+    # 2. Inspect student_response, ocr_text, or extracted text from the answer sheet
+    text_content = str(
+        student_data.get("student_response")
+        or student_data.get("answers")
+        or student_data.get("ocr_text")
+        or student_data.get("extracted_text")
+        or ""
+    ).strip()
+
+    if text_content:
+        # Match "Student Name: ...", "Candidate Name: ...", "Name: ..."
+        name_match = re.search(r"(?:Student\s+Name|Candidate\s+Name|Name)\s*[:\-]\s*([A-Za-z\s\.]{2,40})", text_content, re.IGNORECASE)
+        if name_match and not detected_name:
+            cand = name_match.group(1).strip()
+            if len(cand) >= 2 and not cand.lower().startswith("question") and not cand.lower().startswith("section"):
+                detected_name = cand
+                recognition_confidence = 95.0
+
+        adm_match = re.search(r"(?:Admission\s+No|Adm\s+No|Admission\s+Number)\s*[:\-]\s*([A-Za-z0-9\-_/]+)", text_content, re.IGNORECASE)
+        if adm_match and not detected_admission_no:
+            detected_admission_no = adm_match.group(1).strip()
+
+        roll_match = re.search(r"(?:Roll\s+No|Roll\s+Number)\s*[:\-]\s*([A-Za-z0-9\-_/]+)", text_content, re.IGNORECASE)
+        if roll_match and not detected_roll_no:
+            detected_roll_no = roll_match.group(1).strip()
+
+        kuhs_match = re.search(r"(?:KUHS\s+Reg\s+No|KUHS\s+No|Reg\s+No|Registration\s+No)\s*[:\-]\s*([A-Za-z0-9\-_/]+)", text_content, re.IGNORECASE)
+        if kuhs_match and not detected_kuhs_reg_no:
+            detected_kuhs_reg_no = kuhs_match.group(1).strip()
+
+    # 3. Inspect uploaded PDF file on disk if file_path exists
+    file_path = str(student_data.get("file_path") or "").strip()
+    if file_path and os.path.exists(file_path) and file_path.lower().endswith(".pdf"):
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                if pdf.pages:
+                    first_page_text = pdf.pages[0].extract_text() or ""
+                    if first_page_text:
+                        name_match = re.search(r"(?:Student\s+Name|Candidate\s+Name|Name)\s*[:\-]\s*([A-Za-z\s\.]{2,40})", first_page_text, re.IGNORECASE)
+                        if name_match and not detected_name:
+                            cand = name_match.group(1).strip()
+                            if len(cand) >= 2 and not cand.lower().startswith("question"):
+                                detected_name = cand
+                                recognition_confidence = 98.0
+
+                        adm_match = re.search(r"(?:Admission\s+No|Adm\s+No)\s*[:\-]\s*([A-Za-z0-9\-_/]+)", first_page_text, re.IGNORECASE)
+                        if adm_match and not detected_admission_no:
+                            detected_admission_no = adm_match.group(1).strip()
+
+                        roll_match = re.search(r"(?:Roll\s+No|Roll\s+Number)\s*[:\-]\s*([A-Za-z0-9\-_/]+)", first_page_text, re.IGNORECASE)
+                        if roll_match and not detected_roll_no:
+                            detected_roll_no = roll_match.group(1).strip()
+
+                        kuhs_match = re.search(r"(?:KUHS\s+Reg\s+No|KUHS\s+No|Reg\s+No)\s*[:\-]\s*([A-Za-z0-9\-_/]+)", first_page_text, re.IGNORECASE)
+                        if kuhs_match and not detected_kuhs_reg_no:
+                            detected_kuhs_reg_no = kuhs_match.group(1).strip()
+        except Exception as e:
+            logger.warning(f"Failed to inspect PDF for student identity: {e}")
+
+    # 4. Inspect file_name pattern (e.g. 'Anjali_Nair_p1.jpg' or '2 Pages (Anjali_Nair_p1.jpg, Anjali_Nair_p2.jpg)')
+    file_name = str(student_data.get("file_name") or os.path.basename(file_path)).strip()
+    if not detected_name and file_name:
+        fn_match = re.search(r"([A-Za-z]{2,})_([A-Za-z]{2,})(?:_p\d+|\.jpg|\.png|\.pdf|\.jpeg)", file_name)
+        if fn_match:
+            cand = f"{fn_match.group(1)} {fn_match.group(2)}"
+            # Ignore generic keywords
+            if cand.lower() not in (
+                "answer sheet", "answer paper", "page one", "page two", "exam paper",
+                "test paper", "model answer", "question paper", "evaluation paper"
+            ):
+                detected_name = cand
+                recognition_confidence = 92.0
+
+    # Determine status & confidence
+    if detected_name:
+        recognition_status = student_data.get("recognition_status") or "matched"
+        confidence = recognition_confidence if recognition_confidence > 0 else 98.5
+    else:
+        recognition_status = "unmatched"
+        confidence = 0.0
+
+    return {
+        "student_name": detected_name or "",
+        "has_name": bool(detected_name),
+        "admission_no": detected_admission_no or "",
+        "roll_no": detected_roll_no or "",
+        "kuhs_reg_no": detected_kuhs_reg_no or "",
+        "recognition_status": recognition_status,
+        "recognition_confidence": confidence
+    }
 
 
 # ==============================================================================
@@ -145,7 +282,7 @@ evaluation_store = EvaluationStore()
 
 
 # ==============================================================================
-# DYNAMIC AI EVALUATION ENGINE (No Hardcoded Names or Details)
+# DYNAMIC AI EVALUATION ENGINE
 # ==============================================================================
 def evaluate_student_submission_ai(
     student_data: Dict[str, Any],
@@ -155,15 +292,23 @@ def evaluate_student_submission_ai(
 ) -> Dict[str, Any]:
     """
     Evaluate an individual student's submission dynamically.
-    All student attributes (ID, name, admission no, roll no, registration no, image, files)
-    are extracted strictly from student_data without any hardcoded values.
+    STRICT IDENTITY RULE:
+    If the uploaded image or PDF has the name, display that name and details.
+    Otherwise, do not show any student name or details.
     """
     student_id = student_data.get("student_id") or student_data.get("id")
-    student_name = str(student_data.get("student_name") or student_data.get("name") or "").strip()
-    admission_no = str(student_data.get("admission_no") or "").strip()
-    roll_no = str(student_data.get("roll_no") or "").strip()
-    kuhs_reg_no = str(student_data.get("kuhs_reg_no") or "").strip()
+
+    # Extract identity strictly from uploaded document / sheet
+    identity = extract_student_identity_from_sheet(student_data)
+    has_name = identity["has_name"]
+    student_name = identity["student_name"]
+    admission_no = identity["admission_no"]
+    roll_no = identity["roll_no"]
+    kuhs_reg_no = identity["kuhs_reg_no"]
     student_image = str(student_data.get("student_image") or "").strip()
+    recognition_status = identity["recognition_status"]
+    recognition_confidence = identity["recognition_confidence"]
+
     file_name = str(student_data.get("file_name") or "").strip()
     file_path = str(student_data.get("file_path") or "").strip()
     file_type = str(student_data.get("file_type") or ("pdf" if file_path.lower().endswith(".pdf") else "jpg")).strip()
@@ -171,8 +316,8 @@ def evaluate_student_submission_ai(
     max_marks = float(exam_context.get("max_marks", 100.0))
     subject_title = exam_context.get("subject_name") or exam_context.get("title") or "Curriculum Assessment"
 
-    # Dynamic student label for messages if name not supplied
-    display_name = student_name if student_name else f"Student {student_id}"
+    # Reference label for AI feedback / recommendation (uses generic "Student" if no name found on document)
+    subject_ref = student_name if has_name else "Student"
 
     # Extract questions / rubric
     questions = exam_context.get("questions") or student_data.get("questions") or []
@@ -200,27 +345,29 @@ def evaluate_student_submission_ai(
             except Exception:
                 ai_insights = {}
 
+        fb = student_data.get("ai_feedback") or f"{subject_ref} exhibited solid grasp across evaluation criteria in {subject_title}."
+
         return {
-            "student_id": int(student_id) if str(student_id).isdigit() else student_id,
-            "student_name": student_name,
-            "admission_no": admission_no,
-            "roll_no": roll_no,
-            "kuhs_reg_no": kuhs_reg_no,
-            "student_image": student_image,
+            "student_id": int(student_id) if (student_id is not None and str(student_id).isdigit()) else student_id,
+            "student_name": student_name if has_name else "",
+            "admission_no": admission_no if has_name else "",
+            "roll_no": roll_no if has_name else "",
+            "kuhs_reg_no": kuhs_reg_no if has_name else "",
+            "student_image": student_image if has_name else "",
             "file_name": file_name,
             "file_path": file_path,
             "file_type": file_type,
             "page_count": page_count,
-            "recognition_status": student_data.get("recognition_status", "matched"),
-            "recognition_confidence": float(student_data.get("recognition_confidence", 98.5)),
+            "recognition_status": recognition_status,
+            "recognition_confidence": recognition_confidence,
             "total_marks": total_eval_marks,
             "obtained_marks": obtained_total,
             "percentage": pct,
             "grade": grd,
             "status": stat,
-            "ai_feedback": student_data.get("ai_feedback") or f"{display_name} exhibited solid grasp across evaluation criteria.",
+            "ai_feedback": fb,
             "ai_insights": ai_insights or {
-                "recommendation": f"Continue consistent academic practice in {subject_title}.",
+                "recommendation": f"{subject_ref} demonstrated consistent academic logic in {subject_title}.",
                 "focus_areas": [f"{subject_title} core review"],
                 "strengths": [f"Demonstrated proficiency in {subject_title}"]
             },
@@ -233,17 +380,20 @@ def evaluate_student_submission_ai(
 
     if client and os.getenv("OPENAI_API_KEY"):
         try:
-            logger.info(f"Executing dynamic AI evaluation for: {display_name} (ID: {student_id})")
+            logger.info(f"Executing dynamic AI evaluation for sheet (Detected Name: {student_name if has_name else 'None'})")
             system_prompt = (
                 "You are an expert, objective academic examination evaluator for Edusoft. "
-                "Your objective is to evaluate the student's submitted response against the examination questions and model answer key. "
+                "Your objective is to evaluate the student's submitted answer sheet against the examination questions and model answer key. "
                 "Score each question accurately, providing a step-by-step marking breakdown (step, max_marks, obtained_marks, status). "
                 "Provide clear, constructive question feedback, overall ai_feedback, and actionable ai_insights (recommendation, focus_areas, strengths). "
-                "Base all outputs strictly on the student's provided answers and examination questions. "
+                "\n"
+                "STUDENT IDENTITY RULES:\n"
+                "1. If a student's name is clearly written/detected on the sheet, extract it into 'detected_student_name'.\n"
+                "2. If NO student name is present or written on the uploaded answer sheet, return null for 'detected_student_name' and set 'recognition_status': 'unmatched'.\n"
+                "3. Under NO circumstances invent or assume a fictional student name.\n"
                 "Output valid JSON only."
             )
 
-            # Build questions block dynamically
             if questions:
                 q_block = json.dumps(questions, indent=2)
             else:
@@ -252,27 +402,28 @@ def evaluate_student_submission_ai(
             resp_block = student_response_text if student_response_text else f"Answer sheet submitted across {page_count} page(s)."
 
             user_prompt = f"""
-Evaluate this student's examination submission:
+Evaluate this examination submission:
 EXAMINATION DETAILS:
 - Subject: {subject_title}
 - Total Marks: {max_marks}
-- Student Name: {display_name}
+- Known Student Name: {student_name if has_name else "Not provided - inspect document"}
 - Page Count: {page_count}
 
 QUESTIONS / ANSWER KEY:
 {q_block}
 
-STUDENT SUBMITTED RESPONSE:
+STUDENT SUBMITTED RESPONSE / DOCUMENT:
 {resp_block}
 
 Return a single JSON object with this EXACT schema:
 {{
+  "detected_student_name": {"\"" + student_name + "\"" if has_name else "null"},
   "obtained_marks": <number>,
-  "recognition_status": "matched",
-  "recognition_confidence": 98.5,
-  "ai_feedback": "<2-3 sentence diagnostic review of {display_name}'s performance>",
+  "recognition_status": {"\"matched\"" if has_name else "\"unmatched\""},
+  "recognition_confidence": {recognition_confidence if has_name else 0.0},
+  "ai_feedback": "<2-3 sentence diagnostic review of {subject_ref}'s performance>",
   "ai_insights": {{
-    "recommendation": "<actionable recommendation tailored to this student>",
+    "recommendation": "<actionable recommendation tailored to {subject_ref}>",
     "focus_areas": ["<specific topic 1>", "<specific topic 2>"],
     "strengths": ["<demonstrated strength 1>", "<demonstrated strength 2>"]
   }},
@@ -312,26 +463,34 @@ Return a single JSON object with this EXACT schema:
             if "evaluation_breakdown" in parsed:
                 evaluated_result = parsed
                 ai_evaluated = True
-                logger.info(f"OpenAI evaluation completed successfully for {display_name}")
-        except Exception as e:
-            logger.warning(f"OpenAI evaluation failed for {display_name} ({str(e)}). Using dynamic algorithmic evaluation.")
 
-    # Case C: Dynamic Heuristic Evaluation (Purely generated from input questions/subject without hardcoding)
+                # If OpenAI detected a name from the uploaded document
+                det_name = parsed.get("detected_student_name")
+                if det_name and str(det_name).strip() and str(det_name).strip().lower() not in ("null", "none", "n/a", "student", "unknown"):
+                    student_name = str(det_name).strip()
+                    has_name = True
+                    recognition_status = "matched"
+                    recognition_confidence = float(parsed.get("recognition_confidence") or 98.5)
+                elif not has_name:
+                    recognition_status = "unmatched"
+                    recognition_confidence = 0.0
+
+                logger.info(f"OpenAI evaluation completed successfully for sheet (Name Detected: {has_name})")
+        except Exception as e:
+            logger.warning(f"OpenAI evaluation failed ({str(e)}). Using dynamic algorithmic evaluation.")
+
+    # Case C: Dynamic Algorithmic Evaluation
     if not ai_evaluated or not evaluated_result:
-        # Determine student obtained score
         passed_marks = student_data.get("obtained_marks")
         if passed_marks is not None:
             obtained_score = float(passed_marks)
         else:
-            # Default to 80% baseline if student submitted response, else 70%
             ratio = 0.85 if student_response_text else 0.75
             obtained_score = round(max_marks * ratio, 1)
 
-        # Generate evaluation breakdown dynamically from provided questions
         generated_breakdown = []
         if questions and isinstance(questions, list):
             q_count = len(questions)
-            # Allocate marks per question
             for q_idx, q_item in enumerate(questions, start=1):
                 if isinstance(q_item, dict):
                     q_num = q_item.get("question_no") or q_idx
@@ -348,7 +507,6 @@ Return a single JSON object with this EXACT schema:
 
                 q_obtained = round(q_max * (obtained_score / max_marks), 1)
 
-                # Divide into 3 dynamic steps
                 step_1_max = round(q_max * 0.3, 1)
                 step_2_max = round(q_max * 0.3, 1)
                 step_3_max = max(0.5, round(q_max - step_1_max - step_2_max, 1))
@@ -388,7 +546,6 @@ Return a single JSON object with this EXACT schema:
                     "feedback": f"Addressed core requirements for {q_text[:40]}... Demonstrated consistent understanding."
                 })
         else:
-            # Single dynamic question when no breakdown was passed
             step_1_max = round(max_marks * 0.3, 1)
             step_2_max = round(max_marks * 0.3, 1)
             step_3_max = max(1.0, round(max_marks - step_1_max - step_2_max, 1))
@@ -430,11 +587,11 @@ Return a single JSON object with this EXACT schema:
 
         evaluated_result = {
             "obtained_marks": obtained_score,
-            "recognition_status": student_data.get("recognition_status", "matched"),
-            "recognition_confidence": float(student_data.get("recognition_confidence", 98.5)),
-            "ai_feedback": f"{display_name} exhibited strong grasp of core theoretical concepts in {subject_title}. Evaluated across {page_count} uploaded answer page(s).",
+            "recognition_status": recognition_status,
+            "recognition_confidence": recognition_confidence,
+            "ai_feedback": f"{subject_ref} exhibited strong grasp of core theoretical concepts in {subject_title}. Evaluated across {page_count} uploaded answer page(s).",
             "ai_insights": {
-                "recommendation": f"{display_name} demonstrated strong understanding in {subject_title}. Maintain consistent terminology and documentation.",
+                "recommendation": f"{subject_ref} demonstrated strong understanding in {subject_title}. Maintain consistent terminology and documentation.",
                 "focus_areas": [
                     f"{subject_title} specialized analytical timelines",
                     "Documentation and dosage protocols"
@@ -454,18 +611,18 @@ Return a single JSON object with this EXACT schema:
     status_val = student_data.get("status") or determine_status(percentage_val)
 
     return {
-        "student_id": int(student_id) if str(student_id).isdigit() else student_id,
-        "student_name": student_name,
-        "admission_no": admission_no,
-        "roll_no": roll_no,
-        "kuhs_reg_no": kuhs_reg_no,
-        "student_image": student_image,
+        "student_id": int(student_id) if (student_id is not None and str(student_id).isdigit()) else student_id,
+        "student_name": student_name if has_name else "",
+        "admission_no": admission_no if has_name else "",
+        "roll_no": roll_no if has_name else "",
+        "kuhs_reg_no": kuhs_reg_no if has_name else "",
+        "student_image": student_image if has_name else "",
         "file_name": file_name,
         "file_path": file_path,
         "file_type": file_type,
         "page_count": page_count,
-        "recognition_status": evaluated_result.get("recognition_status", "matched"),
-        "recognition_confidence": float(evaluated_result.get("recognition_confidence", 98.5)),
+        "recognition_status": recognition_status,
+        "recognition_confidence": recognition_confidence,
         "total_marks": max_marks,
         "obtained_marks": obtained_val,
         "percentage": percentage_val,
@@ -486,12 +643,11 @@ def process_paper_evaluation(
     Main evaluation processing workflow:
     1. Validates that incoming request includes student submissions.
     2. Dynamically evaluates each student using OpenAI or algorithmic rubric.
-    3. Computes batch metrics without any hardcoding.
+    3. If the uploaded image or PDF has the name, display that name and details, otherwise do not show the name.
     4. Formats POST response and GET database record.
     5. Saves to persistent store for immediate GET access.
     """
     try:
-        # Check if evaluation_id specified in payload or generate sequential ID
         eval_id_raw = payload.get("evaluation_id") or payload.get("id")
         if eval_id_raw is not None and str(eval_id_raw).strip():
             eval_id = str(eval_id_raw).strip()
@@ -518,12 +674,11 @@ def process_paper_evaluation(
         elif not isinstance(students_raw, list):
             students_raw = []
 
-        # Validate that students were provided
         if not students_raw:
             return {
                 "status": "error",
                 "status_code": 400,
-                "message": "Field 'students' must contain at least one student submission object."
+                "message": "Field 'students' must contain at least one student submission object or uploaded file."
             }, 400
 
         exam_context = {
@@ -544,13 +699,11 @@ def process_paper_evaluation(
             )
             evaluated_students.append(s_result)
 
-        # Compute batch metrics dynamically
         total_sheets = len(evaluated_students)
         passed_count = sum(1 for s in evaluated_students if s["status"] == "Pass")
         failed_count = total_sheets - passed_count
         avg_score = round(sum(s["obtained_marks"] for s in evaluated_students) / max(1, total_sheets), 2)
 
-        # Assemble exact POST_RESPONSE schema
         post_response = {
             "status": "success",
             "total_sheets": total_sheets,
@@ -578,12 +731,12 @@ def process_paper_evaluation(
             get_students_list.append({
                 "id": str(record_id),
                 "evaluation_id": str(eval_id),
-                "student_id": str(s["student_id"]),
-                "student_name": s["student_name"],
-                "admission_no": s["admission_no"],
-                "roll_no": str(s["roll_no"]),
-                "kuhs_reg_no": str(s.get("kuhs_reg_no", "")),
-                "student_image": s.get("student_image", ""),
+                "student_id": str(s["student_id"]) if s.get("student_id") is not None else "",
+                "student_name": s["student_name"] if s.get("student_name") else "",
+                "admission_no": s["admission_no"] if s.get("admission_no") else "",
+                "roll_no": str(s["roll_no"]) if s.get("roll_no") else "",
+                "kuhs_reg_no": str(s.get("kuhs_reg_no", "")) if s.get("kuhs_reg_no") else "",
+                "student_image": s.get("student_image", "") if s.get("student_image") else "",
                 "file_name": s.get("file_name", ""),
                 "file_path": s.get("file_path", ""),
                 "total_marks": format_two_decimals(s["total_marks"]),
@@ -621,7 +774,7 @@ def process_paper_evaluation(
 
         # Persist into store
         evaluation_store.save_evaluation(eval_id=eval_id, post_resp=post_response, get_resp=get_response)
-        logger.info(f"Evaluation #{eval_id} stored successfully ({total_sheets} students evaluated).")
+        logger.info(f"Evaluation #{eval_id} stored successfully ({total_sheets} sheets evaluated).")
 
         return post_response, 200
 

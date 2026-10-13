@@ -1722,10 +1722,30 @@ def evaluate_papers():
                 else:
                     raw_body = dict(request.form)
 
+        # Support multipart file upload if files/images/PDFs attached
+        uploaded_student_files = []
+        if request.files:
+            upload_dir = os.path.join(tempfile.gettempdir(), "evaluation_uploads")
+            os.makedirs(upload_dir, exist_ok=True)
+            for key in request.files:
+                for file_obj in request.files.getlist(key):
+                    if file_obj and file_obj.filename:
+                        safe_filename = file_obj.filename
+                        save_path = os.path.join(upload_dir, safe_filename)
+                        file_obj.save(save_path)
+                        uploaded_student_files.append({
+                            "file_name": safe_filename,
+                            "file_path": save_path,
+                            "file_type": "pdf" if safe_filename.lower().endswith(".pdf") else "jpg"
+                        })
+
+        if raw_body is None and uploaded_student_files:
+            raw_body = {}
+
         if not raw_body or not isinstance(raw_body, dict):
             return jsonify({
                 "status": "error",
-                "message": "Request body must be a valid JSON object containing exam and student evaluation data."
+                "message": "Request body must be a valid JSON object or contain uploaded answer sheet files."
             }), 400
 
         payload = raw_body
@@ -1733,6 +1753,10 @@ def evaluate_papers():
             payload = raw_body["data"]
         elif "payload" in raw_body and isinstance(raw_body["payload"], dict):
             payload = raw_body["payload"]
+
+        # Merge uploaded files if students array not supplied
+        if uploaded_student_files and not payload.get("students"):
+            payload["students"] = uploaded_student_files
 
         response_data, status_code = process_paper_evaluation(
             payload=payload,
