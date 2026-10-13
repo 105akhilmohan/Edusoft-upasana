@@ -9,3 +9,4 @@ venv/
 .git
 .gitignore
 README.md
+evaluations_db.json

@@ -25,8 +25,13 @@ from openai import OpenAI, OpenAIError
 
 logger = logging.getLogger("edusoft_service.paper_evaluator")
 
-# Storage file path
-EVALUATIONS_STORAGE_FILE = os.path.join(os.path.dirname(__file__), "evaluations_db.json")
+# Remove any legacy evaluations file on startup
+for _legacy in ["evaluations_db.json", "/app/evaluations_db.json"]:
+    try:
+        if os.path.exists(_legacy):
+            os.remove(_legacy)
+    except Exception:
+        pass
 
 
 def calculate_grade(percentage: float) -> str:
@@ -281,37 +286,13 @@ def extract_qa_pairs_from_text(text: str) -> List[Dict[str, Any]]:
 
 
 # ==============================================================================
-# PERSISTENT EVALUATION STORE
+# EVALUATION STORE (IN-MEMORY)
 # ==============================================================================
 class EvaluationStore:
-    """Thread-safe persistent store for AI evaluation records."""
+    """In-memory store for AI evaluation records (no disk loading or persistence)."""
 
-    def __init__(self, filepath: str = EVALUATIONS_STORAGE_FILE):
-        self.filepath = filepath
+    def __init__(self):
         self._cache: Dict[str, Dict[str, Any]] = {}
-        self._load()
-
-    def _load(self):
-        """Load records from disk."""
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    if content:
-                        self._cache = json.loads(content)
-                        logger.info(f"Loaded {len(self._cache)} evaluation record(s) from {self.filepath}")
-                        return
-            except Exception as e:
-                logger.warning(f"Error reading evaluations store file ({e}). Starting clean.")
-        self._cache = {}
-
-    def _save(self):
-        """Save records to disk."""
-        try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(self._cache, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Failed to persist evaluations to {self.filepath}: {str(e)}")
 
     def get_evaluation(self, eval_id: str) -> Optional[Dict[str, Any]]:
         record = self._cache.get(str(eval_id))
