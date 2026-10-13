@@ -1,8 +1,10 @@
-# Edusoft AI Analytics & Question Generator API
+# Edusoft AI Analytics, Evaluation & Question Generator API
 
 Flask microservice integrated with OpenAI providing:
 1. **Student Analytical Insights** (`POST /api/generate-insights`): Generates summary, strengths, focus areas, and recommendations from student academic and attendance records.
-2. **Curriculum Question Generator** (`POST /api/generate-questions`): Generates educational questions (MCQ, Short, Long, Numerical) with step-by-step marking schemes.
+2. **Curriculum Question Generator** (`POST /api/generate-questions`): Generates educational questions strictly grounded in textbook content with step-by-step marking schemes.
+3. **Automated AI Paper Evaluation** (`POST /api/evaluate-papers`, `GET /api/evaluation/<id>`): Evaluates student answer papers against model answers, producing question-by-question step markings, recognition confidence, letter grades, feedback, and diagnostic insights.
+4. **Timetable Schedule Generator** (`POST /api/generate-timetable`): Multi-teacher conflict resolution, leave management, and schedule optimization.
 
 ---
 
@@ -214,4 +216,196 @@ docker logs -f edusoft_question_generator
   }
 }
 ```
+
+---
+
+### 4. Automated AI Paper Evaluation (POST)
+- **URL:** `/api/evaluate-papers` (or `/api/evaluate-paper`, `/evaluate-papers`, `/api/evaluations`)
+- **Method:** `POST`
+- **Headers:** `Content-Type: application/json`
+
+Evaluates student answer sheets against model answers/rubrics using AI, producing question-level step-marking breakdowns, recognition confidence, letter grades, pass/fail status, AI feedback, and clinical/academic diagnostic insights. Automatically persists results for subsequent GET querying.
+
+#### Request Payload
+```json
+{
+  "title": "Medical Surgical Nursing - Mid Term Exam 2026",
+  "class_id": 3,
+  "class_name": "B.Sc. Nursing (Year II)",
+  "section_id": 1,
+  "section_name": "Section A",
+  "subject_id": 12,
+  "subject_name": "Medical Surgical Nursing",
+  "question_paper_id": 14,
+  "question_paper_title": "Medical Surgical Nursing - Mid Term Exam 2026",
+  "max_marks": 100.0,
+  "answer_key_file": "uploads/evaluation_papers/1741512300_key_model_answers.pdf",
+  "questions": [
+    {
+      "question_no": 1,
+      "question_text": "Describe the pathophysiology and nursing management of Acute Myocardial Infarction.",
+      "question_type": "Descriptive",
+      "max_marks": 20.0,
+      "answer_key": "Plaque rupture, coronary thrombus, MONA protocol, 12-lead ECG monitoring."
+    }
+  ],
+  "students": [
+    {
+      "student_id": 84,
+      "student_name": "Anjali Nair",
+      "admission_no": "AKG/2024/001",
+      "roll_no": "101",
+      "kuhs_reg_no": "210010482",
+      "student_image": "uploads/student_images/1709123456.jpg",
+      "file_name": "2 Pages (Anjali_Nair_p1.jpg, Anjali_Nair_p2.jpg)",
+      "file_path": "uploads/evaluation_papers/1741512300_0_Anjali_Nair_p1.jpg",
+      "file_type": "jpg",
+      "page_count": 2,
+      "student_response": "Plaque rupture leading to coronary thrombus formation and transmural ischemia. MONA protocol initiated with Oxygen, Aspirin, Nitroglycerin, Morphine, along with 12-lead ECG monitoring."
+    }
+  ]
+}
+```
+
+#### Response Payload (`POST_RESPONSE`)
+```json
+{
+  "status": "success",
+  "total_sheets": 1,
+  "passed_count": 1,
+  "failed_count": 0,
+  "average_score": 88.5,
+  "max_marks": 100.0,
+  "answer_key_file": "uploads/evaluation_papers/1741512300_key_model_answers.pdf",
+  "students": [
+    {
+      "student_id": 84,
+      "student_name": "Anjali Nair",
+      "admission_no": "AKG/2024/001",
+      "roll_no": "101",
+      "kuhs_reg_no": "210010482",
+      "student_image": "uploads/student_images/1709123456.jpg",
+      "file_name": "2 Pages (Anjali_Nair_p1.jpg, Anjali_Nair_p2.jpg)",
+      "file_path": "uploads/evaluation_papers/1741512300_0_Anjali_Nair_p1.jpg",
+      "file_type": "jpg",
+      "page_count": 2,
+      "recognition_status": "matched",
+      "recognition_confidence": 98.5,
+      "total_marks": 100.0,
+      "obtained_marks": 88.5,
+      "percentage": 88.5,
+      "grade": "A",
+      "status": "Pass",
+      "ai_feedback": "Student exhibited strong grasp of core theoretical concepts. Evaluated across 2 uploaded answer page(s) with A overall proficiency.",
+      "ai_insights": {
+        "recommendation": "Student demonstrated strong clinical logic in cardiac emergencies. Maintain consistent terminology and documentation.",
+        "focus_areas": [
+          "Pathophysiology biomarker curve timelines",
+          "Emergency dosage documentation"
+        ],
+        "strengths": [
+          "Accurate MONA protocol sequencing",
+          "Adherence to aseptic standards"
+        ]
+      },
+      "evaluation_breakdown": [
+        {
+          "question_no": 1,
+          "question_text": "Describe the pathophysiology and nursing management of Acute Myocardial Infarction.",
+          "question_type": "Descriptive",
+          "max_marks": 20.0,
+          "obtained_marks": 18.5,
+          "answer_key": "Plaque rupture, coronary thrombus, MONA protocol, 12-lead ECG monitoring.",
+          "student_response": "Student response extracted and verified across 2 uploaded answer page(s).",
+          "step_marking": [
+            {
+              "step": "Pathophysiology & Mechanism",
+              "max_marks": 6.0,
+              "obtained_marks": 5.5,
+              "status": "Full"
+            },
+            {
+              "step": "Clinical Manifestations",
+              "max_marks": 6.0,
+              "obtained_marks": 5.5,
+              "status": "Full"
+            },
+            {
+              "step": "Nursing Interventions (MONA Protocol)",
+              "max_marks": 8.0,
+              "obtained_marks": 7.5,
+              "status": "Full"
+            }
+          ],
+          "feedback": "Demonstrated clear comprehension in written answer sheets. Key clinical terminology, diagnosis, and interventions were accurately stated."
+        }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### 5. Fetch Evaluation Details (GET)
+- **URL:** `/api/evaluation/{id}` (or `/api/evaluations/{id}`, `/evaluation/{id}`)
+- **Method:** `GET`
+- **Headers:** `Accept: application/json`
+
+Retrieves saved evaluation header and student results for institutional reporting and grade sheet generation.
+
+#### Response Payload (`GET_RESPONSE`)
+```json
+{
+  "status": "success",
+  "data": {
+    "id": "5",
+    "title": "Medical Surgical Nursing - Mid Term Exam 2026",
+    "class_id": "3",
+    "class_name": "B.Sc. Nursing (Year II)",
+    "section_id": "1",
+    "section_name": "Section A",
+    "subject_id": "12",
+    "subject_name": "Medical Surgical Nursing",
+    "question_paper_id": "14",
+    "question_paper_title": "Medical Surgical Nursing - Mid Term Exam 2026",
+    "total_students": "1",
+    "passed_count": "1",
+    "failed_count": "0",
+    "average_score": "88.50",
+    "max_marks": "100.00",
+    "evaluation_date": "2026-03-15",
+    "created_at": "2026-03-15 14:22:10",
+    "students": [
+      {
+        "id": "18",
+        "evaluation_id": "5",
+        "student_id": "84",
+        "student_name": "Anjali Nair",
+        "admission_no": "AKG/2024/001",
+        "roll_no": "101",
+        "kuhs_reg_no": "210010482",
+        "student_image": "uploads/student_images/1709123456.jpg",
+        "file_name": "2 Pages (Anjali_Nair_p1.jpg, Anjali_Nair_p2.jpg)",
+        "file_path": "uploads/evaluation_papers/1741512300_0_Anjali_Nair_p1.jpg",
+        "total_marks": "100.00",
+        "obtained_marks": "88.50",
+        "percentage": "88.50",
+        "grade": "A",
+        "status": "Pass",
+        "ai_feedback": "Student exhibited strong grasp of core theoretical concepts.",
+        "ai_insights": "{\"recommendation\":\"Student demonstrated strong clinical logic.\",\"focus_areas\":[\"Pathophysiology timelines\"]}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 6. Additional Evaluation Endpoints
+- **List All Evaluations:** `GET /api/evaluations` - Returns array of all evaluation summaries.
+- **Detailed Step Breakdown:** `GET /api/evaluation/{id}/breakdown` - Returns the comprehensive question-level breakdown for the entire evaluation.
+- **Student Specific Breakdown:** `GET /api/evaluation/{id}/student/{student_id}` - Returns the full evaluation sheet for a specific student.
+
 

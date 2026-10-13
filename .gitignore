@@ -40,5 +40,6 @@ ENV/
 *.swp
 *.swo
 
-# Logs
+# Logs and local databases
 *.log
+evaluations_db.json

@@ -39,6 +39,7 @@ DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 from timetable_generator import generate_timetable_ai
+from paper_evaluator import process_paper_evaluation, evaluation_store
 
 
 @app.after_request
@@ -51,16 +52,19 @@ def log_response_status(response):
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "service": "Edusoft AI Analytics & Question Generator API",
+        "service": "Edusoft AI Analytics, Evaluation & Question Generator API",
         "status": "online",
         "status_code": 200,
-        "version": "1.4.0",
+        "version": "1.5.0",
         "endpoints": {
             "health": "GET /health",
             "generate_insights": "POST /api/generate-insights",
             "generate_questions": "POST /api/generate-questions",
             "extract_syllabus": "POST /api/extract-syllabus",
-            "generate_timetable": "POST /api/generate-timetable"
+            "generate_timetable": "POST /api/generate-timetable",
+            "evaluate_papers": "POST /api/evaluate-papers",
+            "get_evaluation": "GET /api/evaluation/<id>",
+            "list_evaluations": "GET /api/evaluations"
         }
     }), 200
 
@@ -1687,9 +1691,147 @@ def generate_timetable():
         }), 500
 
 
+# ==============================================================================
+# 5. AUTOMATED AI PAPER EVALUATION ENDPOINTS (POST & GET)
+# ==============================================================================
+@app.route("/api/evaluate-papers", methods=["POST"])
+@app.route("/api/evaluate-paper", methods=["POST"])
+@app.route("/api/evaluation/evaluate", methods=["POST"])
+@app.route("/evaluate-papers", methods=["POST"])
+def evaluate_papers():
+    """
+    Automated evaluation of student answer papers/sheets evaluated through AI.
+    Produces step-by-step question scoring, recognition status, AI feedback,
+    and diagnostic insights matching Edusoft ERP POST_RESPONSE specification.
+    """
+    try:
+        raw_body = request.get_json(silent=True, force=True)
+        if raw_body is None:
+            if request.data:
+                try:
+                    raw_body = json.loads(request.data.decode("utf-8"))
+                except Exception:
+                    pass
+            if raw_body is None and request.form:
+                form_val = request.form.get("data") or request.form.get("payload") or request.form.get("body")
+                if form_val:
+                    try:
+                        raw_body = json.loads(form_val)
+                    except Exception:
+                        pass
+                else:
+                    raw_body = dict(request.form)
+
+        if not raw_body or not isinstance(raw_body, dict):
+            return jsonify({
+                "status": "error",
+                "message": "Request body must be a valid JSON object containing exam and student evaluation data."
+            }), 400
+
+        payload = raw_body
+        if "data" in raw_body and isinstance(raw_body["data"], dict):
+            payload = raw_body["data"]
+        elif "payload" in raw_body and isinstance(raw_body["payload"], dict):
+            payload = raw_body["payload"]
+
+        response_data, status_code = process_paper_evaluation(
+            payload=payload,
+            client=client,
+            default_model=DEFAULT_MODEL
+        )
+        return jsonify(response_data), status_code
+
+    except OpenAIError as oe:
+        logger.error(f"OpenAI API Error in paper evaluation: {str(oe)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "status_code": 502,
+            "message": "OpenAI API Error",
+            "details": str(oe)
+        }), 502
+    except Exception as e:
+        logger.error(f"Internal Server Error in paper evaluation: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "status_code": 500,
+            "message": "Internal Server Error",
+            "details": str(e)
+        }), 500
+
+
+@app.route("/api/evaluations", methods=["GET", "POST"])
+def manage_evaluations():
+    """
+    POST: Trigger paper evaluation.
+    GET: List all stored evaluations in the system.
+    """
+    if request.method == "POST":
+        return evaluate_papers()
+    
+    # GET list
+    all_evals = evaluation_store.list_all_evaluations()
+    return jsonify({
+        "status": "success",
+        "count": len(all_evals),
+        "data": all_evals
+    }), 200
+
+
+@app.route("/api/evaluation/<evaluation_id>", methods=["GET"])
+@app.route("/api/evaluations/<evaluation_id>", methods=["GET"])
+@app.route("/evaluation/<evaluation_id>", methods=["GET"])
+def get_evaluation_by_id(evaluation_id):
+    """
+    Retrieve stored evaluation details and student marks by evaluation ID.
+    Matches exact GET_RESPONSE specification.
+    """
+    record = evaluation_store.get_evaluation(evaluation_id)
+    if not record:
+        return jsonify({
+            "status": "error",
+            "message": f"Evaluation #{evaluation_id} not found."
+        }), 404
+    return jsonify(record), 200
+
+
+@app.route("/api/evaluation/<evaluation_id>/breakdown", methods=["GET"])
+@app.route("/api/evaluations/<evaluation_id>/breakdown", methods=["GET"])
+def get_evaluation_breakdown(evaluation_id):
+    """
+    Retrieve full question-by-question step-marking breakdown for an evaluation.
+    """
+    record = evaluation_store.get_post_evaluation(evaluation_id)
+    if not record:
+        return jsonify({
+            "status": "error",
+            "message": f"Evaluation #{evaluation_id} not found."
+        }), 404
+    return jsonify(record), 200
+
+
+@app.route("/api/evaluation/<evaluation_id>/student/<student_id>", methods=["GET"])
+@app.route("/api/evaluations/<evaluation_id>/student/<student_id>", methods=["GET"])
+def get_student_evaluation_breakdown(evaluation_id, student_id):
+    """
+    Retrieve individual student's detailed evaluation sheet with step-marking breakdown.
+    """
+    student_eval = evaluation_store.get_student_evaluation(evaluation_id, student_id)
+    if not student_eval:
+        return jsonify({
+            "status": "error",
+            "message": f"Student #{student_id} in evaluation #{evaluation_id} not found."
+        }), 404
+    return jsonify({
+        "status": "success",
+        "evaluation_id": evaluation_id,
+        "student": student_eval
+    }), 200
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     debug = os.getenv("FLASK_ENV", "production").lower() == "development"
     logger.info(f"Starting Edusoft AI server on port {port} (debug={debug})")
     app.run(host="0.0.0.0", port=port, debug=debug)
+
 
