@@ -1816,7 +1816,68 @@ def evaluate_papers():
                     except Exception:
                         pass
 
-        # Disregard any incoming student identity sent by PHP backend; only retrieve identity written in PDF/image
+        # Preserve authoritative student identity supplied by PHP backend before stripping payload fields
+        backend_roster = []
+        raw_students = payload.get("students")
+        if isinstance(raw_students, list) and raw_students:
+            for idx, s in enumerate(raw_students):
+                if isinstance(s, dict):
+                    s_id = (
+                        s.get("student_id")
+                        or s.get("id")
+                        or s.get("admission_no")
+                        or s.get("adm_no")
+                        or s.get("roll_no")
+                        or s.get("roll_number")
+                        or s.get("reg_no")
+                        or s.get("registration_no")
+                        or s.get("kuhs_reg_no")
+                    )
+                    s_name = s.get("student_name") or s.get("name")
+                    backend_roster.append({
+                        "index": idx + 1,
+                        "student_id": str(s_id).strip() if s_id is not None and str(s_id).strip() else None,
+                        "student_name": str(s_name).strip() if s_name is not None and str(s_name).strip() else None,
+                        "admission_no": str(s.get("admission_no") or s.get("adm_no") or "").strip(),
+                        "roll_no": str(s.get("roll_no") or s.get("roll_number") or "").strip(),
+                        "kuhs_reg_no": str(s.get("kuhs_reg_no") or "").strip(),
+                        "file_path": s.get("file_path", "")
+                    })
+        if not backend_roster:
+            top_id = (
+                payload.get("student_id")
+                or payload.get("id")
+                or payload.get("admission_no")
+                or payload.get("adm_no")
+                or payload.get("roll_no")
+                or payload.get("roll_number")
+                or payload.get("reg_no")
+                or payload.get("registration_no")
+                or payload.get("kuhs_reg_no")
+                or (raw_body.get("data", {}).get("student_id") if isinstance(raw_body.get("data"), dict) else None)
+                or (raw_body.get("payload", {}).get("student_id") if isinstance(raw_body.get("payload"), dict) else None)
+            )
+            top_name = (
+                payload.get("student_name")
+                or payload.get("name")
+                or (raw_body.get("data", {}).get("student_name") if isinstance(raw_body.get("data"), dict) else None)
+                or (raw_body.get("payload", {}).get("student_name") if isinstance(raw_body.get("payload"), dict) else None)
+            )
+            if top_id is not None or top_name is not None:
+                backend_roster.append({
+                    "index": 1,
+                    "student_id": str(top_id).strip() if top_id is not None and str(top_id).strip() else None,
+                    "student_name": str(top_name).strip() if top_name is not None and str(top_name).strip() else None,
+                    "admission_no": str(payload.get("admission_no") or payload.get("adm_no") or "").strip(),
+                    "roll_no": str(payload.get("roll_no") or payload.get("roll_number") or "").strip(),
+                    "kuhs_reg_no": str(payload.get("kuhs_reg_no") or "").strip(),
+                    "file_path": payload.get("file_path", "")
+                })
+
+        payload["_backend_roster"] = backend_roster
+
+        # Disregard incoming student identity sent by PHP backend in document evaluation working copy;
+        # document-extracted identity will remain independently recorded.
         IDENTITY_FIELDS = [
             "student_name", "student_id", "name", "id", "admission_no", "adm_no",
             "roll_no", "roll_number", "kuhs_reg_no", "reg_no", "registration_no",

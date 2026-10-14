@@ -425,13 +425,14 @@ FORBIDDEN_NAME_WORDS = {
     "edusoft", "module", "assignment", "evaluation", "reg", "roll", "admission",
     "total", "score", "pass", "fail", "model", "answer", "signature", "pharmacy",
     "nursing", "engineering", "school", "medical", "centre", "center", "title",
-    "instructor", "invigilator", "teacher", "evaluator", "examiner", "candidate",
-    "student", "code", "year", "session", "instruction", "instructions", "booklet",
+    "instructor", "invigilator", "teacher", "evaluator", "examiner",
+    "code", "year", "session", "instruction", "instructions", "booklet",
     "book", "duration", "time", "hours", "mins", "maximum", "min", "max",
     "hall", "ticket", "scheme", "syllabus", "regular", "supplementary", "theory",
     "practical", "page", "sheet", "pages", "sheets", "pathology", "anatomy",
     "physiology", "pharmacology", "microbiology", "biochemistry", "medicine",
-    "surgery", "pediatrics", "mathematics", "physics", "chemistry", "biology"
+    "surgery", "pediatrics", "mathematics", "physics", "chemistry", "biology",
+    "annual", "government", "govt", "midterm", "terminal", "assessment", "half-yearly"
 }
 
 
@@ -450,10 +451,17 @@ def _validate_student_name(cand: str) -> Optional[str]:
     if any(c.isdigit() for c in cand):
         return None
     lower_cand = cand.lower()
+    # Reject strings that are just labels or metadata phrases
+    if lower_cand in (
+        "student", "candidate", "examinee", "name", "student name", "candidate name",
+        "examinee name", "name of student", "name of candidate", "name of the student"
+    ):
+        return None
     # Check if starts with non-name prefixes
     if any(lower_cand.startswith(f) for f in [
         "question", "section", "subject", "exam", "paper", "test", "final", "total",
-        "marks", "date", "class", "signature", "invigilator", "page", "sheet", "instructions"
+        "marks", "date", "class", "signature", "invigilator", "page", "sheet", "instructions",
+        "maximum", "min", "max", "annual", "government", "govt"
     ]):
         return None
     words = [w.strip(".,;:()") for w in lower_cand.split() if w.strip(".,;:()")]
@@ -481,6 +489,12 @@ def _validate_student_id(cand: str) -> Optional[str]:
     # Do not confuse with dates (e.g. 14/10/2026 or 2026-10-14)
     if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$", cand) or re.match(r"^\d{4}[/-]\d{1,2}[/-]\d{1,2}$", cand):
         return None
+    # Do not confuse with marks (e.g. 100/100, 10/10, 80/100, 50/50)
+    if re.match(r"^\d{1,3}/\d{1,3}$", cand):
+        return None
+    # Do not confuse with page references (e.g. 1/4, 2/4)
+    if re.match(r"^(?:Page|Sheet)?\s*\d+\s*(?:/|of)\s*\d+$", cand, re.IGNORECASE):
+        return None
     # Do not confuse with question numbers or section headers
     if re.match(r"^(?:Question|Q|Ans|Section|Page|Sheet)\b", cand, re.IGNORECASE):
         return None
@@ -497,12 +511,14 @@ def _extract_name_from_text(chunk: str) -> Optional[str]:
     if not chunk:
         return None
 
+    stop_keywords = r"\b(?:Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|\d{4})\b"
+
     # Pattern 1: Same line with separator (colon, hyphen, dot, equal, or space)
     # e.g., "Student Name: Rahul Verma", "Candidate Name - Rahul Verma", "Name of Student: Rahul Verma"
     pattern_same_line = re.compile(
         r"(?:Student\s*Name|Candidate\s*Name|Name\s*of\s*(?:the\s*)?(?:Student|Candidate|Examinee)|Student(?:'s)?\s*Name|Candidate(?:'s)?\s*Name|Examinee\s*Name)"
         r"[ \t]*[:\-\.=#]?[ \t]*([A-Za-z][A-Za-z\s\.\'\-]{1,50}?)"
-        r"(?=[ \t]*(?:\r?\n|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|\b\d{4}\b|$))",
+        rf"(?=[ \t]*(?:\r?\n|{stop_keywords}|$))",
         re.IGNORECASE
     )
     for m in pattern_same_line.finditer(chunk):
@@ -515,7 +531,7 @@ def _extract_name_from_text(chunk: str) -> Optional[str]:
     pattern_next_line = re.compile(
         r"(?:Student\s*Name|Candidate\s*Name|Name\s*of\s*(?:the\s*)?(?:Student|Candidate|Examinee)|Student(?:'s)?\s*Name|Candidate(?:'s)?\s*Name|Examinee\s*Name)"
         r"[ \t]*[:\-\.=#]?[ \t]*\r?\n[ \t]*([A-Za-z][A-Za-z\s\.\'\-]{1,50}?)"
-        r"(?=[ \t]*(?:\r?\n|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|$))",
+        rf"(?=[ \t]*(?:\r?\n|{stop_keywords}|$))",
         re.IGNORECASE
     )
     for m in pattern_next_line.finditer(chunk):
@@ -527,7 +543,7 @@ def _extract_name_from_text(chunk: str) -> Optional[str]:
     pattern_block = re.compile(
         r"(?:Candidate|Student|Examinee)\s*(?:Information|Details|Particulars|Data)[\s\S]{1,200}?"
         r"\bName[ \t]*[:\-\.=#]?[ \t]*([A-Za-z][A-Za-z\s\.\'\-]{1,50}?)"
-        r"(?=[ \t]*(?:\r?\n|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|$))",
+        rf"(?=[ \t]*(?:\r?\n|{stop_keywords}|$))",
         re.IGNORECASE
     )
     m_block = pattern_block.search(chunk)
@@ -539,10 +555,14 @@ def _extract_name_from_text(chunk: str) -> Optional[str]:
     return None
 
 
-def _extract_ids_from_text(chunk: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+def _extract_ids_from_text(
+    chunk: str,
+    backend_roster: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Extract student ID, roll number, admission number, and KUHS registration number
-    from a text chunk. Preserves leading zeros and meaningful symbols.
+    from a text chunk. Preserves leading zeros, hyphens, and slashes.
+    Supports labeled fields and unlabeled alphanumeric codes (e.g. AKN-25/1110/) in top/header.
     Returns: (detected_id, detected_adm, detected_roll, detected_kuhs)
     """
     if not chunk:
@@ -554,7 +574,7 @@ def _extract_ids_from_text(chunk: str) -> Tuple[Optional[str], Optional[str], Op
     detected_kuhs = None
 
     # Stop lookahead to avoid capturing subsequent form fields on same line
-    stop_lookahead = r"(?=[ \t]*(?:\r?\n|Name|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|Page|Sheet|$))"
+    stop_lookahead = r"(?=[ \t]*(?:\r?\n|\b(?:Name|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|Page|Sheet)\b|$))"
 
     # 1. Student ID / Candidate ID / Student Number / Student No / Candidate Number
     sid_re_same = re.compile(
@@ -642,6 +662,54 @@ def _extract_ids_from_text(chunk: str) -> Tuple[Optional[str], Optional[str], Op
                 detected_kuhs = val
                 break
 
+    # 6. Unlabeled student code in top/header area:
+    # Inspect top header lines (first 800 characters) before questions start
+    if not (detected_id or detected_roll or detected_kuhs or detected_adm):
+        header_area = chunk[:800]
+        q_match = re.search(r"(?:^|\n)\s*(?:Question\s*\d+|Q\s*\d+|1[\.\)])\b", header_area, re.IGNORECASE)
+        if q_match and q_match.start() > 10:
+            header_area = header_area[:q_match.start()]
+
+        candidate_re = re.compile(
+            r"(?:^|[\s|:;,])([A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)+/?)(?=[\s|:;,]|$)",
+            re.MULTILINE
+        )
+        standalone_re = re.compile(
+            r"^[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{2,34})[ \t]*$",
+            re.MULTILINE
+        )
+
+        found_candidates: List[str] = []
+        seen = set()
+
+        for m in list(candidate_re.finditer(header_area)) + list(standalone_re.finditer(header_area)):
+            raw_c = m.group(1).strip(" \t\r\n:;,")
+            val = _validate_student_id(raw_c)
+            if val and val.upper() not in seen:
+                # Must contain at least one digit or match backend roster
+                has_digit = any(c.isdigit() for c in val)
+                if has_digit:
+                    seen.add(val.upper())
+                    found_candidates.append(val)
+
+        if found_candidates:
+            # Check against backend roster if supplied
+            if backend_roster:
+                roster_ids = {
+                    normalize_id_for_comparison(b.get("student_id")): b.get("student_id")
+                    for b in backend_roster if b.get("student_id")
+                }
+                for c in found_candidates:
+                    if normalize_id_for_comparison(c) in roster_ids:
+                        detected_id = c
+                        break
+
+            if not detected_id:
+                if len(found_candidates) == 1:
+                    detected_id = found_candidates[0]
+                else:
+                    logger.info(f"Multiple plausible candidate codes found in header: {found_candidates}. Flagging for review.")
+
     # If detected_id was not explicitly set by Student ID / Candidate ID / Student Number,
     # fall back to roll number, registration number, or admission number
     if not detected_id:
@@ -652,15 +720,17 @@ def _extract_ids_from_text(chunk: str) -> Tuple[Optional[str], Optional[str], Op
 
 def extract_identity_from_document_text(
     text: str,
-    page_texts: Optional[List[str]] = None
+    page_texts: Optional[List[str]] = None,
+    backend_roster: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Search document text for student name and student ID.
     - Inspects the full cover page and header of the booklet.
+    - Supports unlabeled student codes (e.g. AKN-25/1110/).
     - Preserves page boundaries and inspects Page 1 first.
     - Searches additional pages only when needed to recover missing identity info.
     - Normalizes PDF extraction artifacts without altering actual student name or ID.
-    - Preserves leading zeros and symbols in IDs.
+    - Preserves leading zeros, hyphens, and slashes in IDs.
     Returns: (detected_name, detected_id, detected_adm, detected_roll, detected_kuhs)
     """
     if not text and not page_texts:
@@ -684,7 +754,7 @@ def extract_identity_from_document_text(
     # Step 1: Inspect Page 1 (full cover page and candidate information section)
     page_1 = pages[0]
     detected_name = _extract_name_from_text(page_1)
-    detected_id, detected_adm, detected_roll, detected_kuhs = _extract_ids_from_text(page_1)
+    detected_id, detected_adm, detected_roll, detected_kuhs = _extract_ids_from_text(page_1, backend_roster=backend_roster)
 
     # If both name and ID are found on Page 1, return immediately
     if detected_name and detected_id:
@@ -693,7 +763,6 @@ def extract_identity_from_document_text(
     # Step 2: Search additional pages in the booklet ONLY when needed to recover identity
     for p_idx in range(1, len(pages)):
         p_chunk = pages[p_idx]
-        # Check header area (first 800 chars) as well as candidate block
         header_chunk = p_chunk[:800]
         search_chunk = p_chunk if len(p_chunk) <= 1500 else header_chunk
 
@@ -703,7 +772,7 @@ def extract_identity_from_document_text(
                 detected_name = rec_name
 
         if not detected_id:
-            rec_id, rec_adm, rec_roll, rec_kuhs = _extract_ids_from_text(search_chunk)
+            rec_id, rec_adm, rec_roll, rec_kuhs = _extract_ids_from_text(search_chunk, backend_roster=backend_roster)
             if rec_id:
                 detected_id = rec_id
             if rec_adm and not detected_adm:
@@ -713,7 +782,6 @@ def extract_identity_from_document_text(
             if rec_kuhs and not detected_kuhs:
                 detected_kuhs = rec_kuhs
 
-        # Break early once both name and ID are recovered
         if detected_name and detected_id:
             break
 
@@ -722,6 +790,177 @@ def extract_identity_from_document_text(
         detected_id = detected_roll or detected_kuhs or detected_adm
 
     return detected_name, detected_id, detected_adm, detected_roll, detected_kuhs
+
+
+def normalize_id_for_comparison(val: Any) -> str:
+    """Normalize student ID for comparison, preserving leading zeros, letters, hyphens, and slashes."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    return s.rstrip("/").upper()
+
+
+def normalize_name_for_comparison(val: Any) -> str:
+    """Normalize student name for comparison, handling harmless case and whitespace differences."""
+    if val is None:
+        return ""
+    words = [w.strip(".,;'-") for w in str(val).strip().lower().split() if w.strip(".,;'-")]
+    return " ".join(words)
+
+
+def match_student_identity_with_backend(
+    extracted_id: Optional[str],
+    extracted_name: Optional[str],
+    backend_record: Optional[Dict[str, Any]],
+    extracted_roll: Optional[str] = None,
+    extracted_adm: Optional[str] = None,
+    extracted_kuhs: Optional[str] = None,
+    is_unverified: bool = False
+) -> Dict[str, Any]:
+    """
+    Compare document-extracted student identity against authoritative PHP backend identity.
+    - Preserves meaningful ID characters (leading zeros, hyphens, slashes).
+    - Secondary validation against student name (case/whitespace insensitive).
+    - Rejects identity if extracted name conflicts with backend name.
+    - Flags ambiguous extraction for review.
+    - Never marks matched merely because an ID or name was extracted.
+    """
+    if not backend_record:
+        # Standalone evaluation without backend verification record
+        if is_unverified:
+            return {
+                "recognition_status": "unverified",
+                "recognition_confidence": 50.0,
+                "identity_manual_review": True,
+                "recognized_text": f"Unverified: Document identity {extracted_name or extracted_id or ''} is ambiguous. Flagged for manual review."
+            }
+        elif extracted_id or extracted_name:
+            return {
+                "recognition_status": "matched",
+                "recognition_confidence": 98.5,
+                "identity_manual_review": False,
+                "recognized_text": f"Extracted from document: {extracted_name or ''}" + (f" (ID: {extracted_id})" if extracted_id else "")
+            }
+        else:
+            return {
+                "recognition_status": "unmatched",
+                "recognition_confidence": 0.0,
+                "identity_manual_review": False,
+                "recognized_text": "No student identity found on document."
+            }
+
+    backend_id = (
+        backend_record.get("student_id")
+        or backend_record.get("id")
+        or backend_record.get("roll_no")
+        or backend_record.get("admission_no")
+        or backend_record.get("reg_no")
+        or backend_record.get("kuhs_reg_no")
+    )
+    backend_name = backend_record.get("student_name") or backend_record.get("name")
+
+    backend_id_str = str(backend_id).strip() if backend_id is not None and str(backend_id).strip() else None
+    backend_name_str = str(backend_name).strip() if backend_name is not None and str(backend_name).strip() else None
+
+    # If extraction on document was ambiguous, smudged, or multiple conflicting codes found
+    if is_unverified:
+        return {
+            "recognition_status": "unverified",
+            "recognition_confidence": 50.0,
+            "identity_manual_review": True,
+            "recognized_text": f"Unverified document identity: Extracted data is ambiguous or partially decipherable against backend record ({backend_id_str or backend_name_str}). Flagged for manual review."
+        }
+
+    # If nothing was extracted from the document
+    if not extracted_id and not extracted_name and not extracted_roll and not extracted_adm:
+        return {
+            "recognition_status": "unmatched",
+            "recognition_confidence": 0.0,
+            "identity_manual_review": False,
+            "recognized_text": f"No student identity detected on answer sheet. Unmatched against backend record ({backend_id_str or backend_name_str})."
+        }
+
+    # Compare ID
+    id_matched = False
+    if backend_id_str:
+        norm_b_id = normalize_id_for_comparison(backend_id_str)
+        candidate_ids = [c for c in [extracted_id, extracted_roll, extracted_adm, extracted_kuhs] if c]
+        for cid in candidate_ids:
+            if normalize_id_for_comparison(cid) == norm_b_id:
+                id_matched = True
+                break
+
+    # Secondary validation: Compare Name
+    name_matched: Optional[bool] = None
+    if backend_name_str and extracted_name:
+        norm_b_name = normalize_name_for_comparison(backend_name_str)
+        norm_e_name = normalize_name_for_comparison(extracted_name)
+        if norm_b_name == norm_e_name:
+            name_matched = True
+        else:
+            name_matched = False
+
+    # Resolution logic:
+    if backend_id_str:
+        if id_matched:
+            # ID matched! Check secondary name validation
+            if name_matched is False:
+                # Name is explicitly different! Genuine conflict / mismatch
+                return {
+                    "recognition_status": "unmatched",
+                    "recognition_confidence": 40.0,
+                    "identity_manual_review": True,
+                    "recognized_text": (
+                        f"Identity conflict: Extracted code '{extracted_id}' matches backend ID, "
+                        f"but extracted name '{extracted_name}' does not match backend student '{backend_name_str}'."
+                    )
+                }
+            else:
+                conf = 99.0 if (name_matched is True) else 98.0
+                rec_desc = f"Verified: Extracted code '{extracted_id}' matches PHP backend record '{backend_id_str}'"
+                if name_matched is True:
+                    rec_desc += f" and name '{extracted_name}' is confirmed."
+                return {
+                    "recognition_status": "matched",
+                    "recognition_confidence": conf,
+                    "identity_manual_review": False,
+                    "recognized_text": rec_desc
+                }
+        else:
+            # ID genuinely mismatched!
+            return {
+                "recognition_status": "unmatched",
+                "recognition_confidence": 0.0,
+                "identity_manual_review": False,
+                "recognized_text": (
+                    f"Identity mismatch: Extracted code '{extracted_id or extracted_roll or ''}' "
+                    f"does not match authoritative PHP backend ID '{backend_id_str}'."
+                )
+            }
+    elif backend_name_str:
+        # Backend only supplied name
+        if name_matched is True:
+            return {
+                "recognition_status": "matched",
+                "recognition_confidence": 95.0,
+                "identity_manual_review": False,
+                "recognized_text": f"Verified: Extracted student name '{extracted_name}' matches PHP backend record."
+            }
+        else:
+            return {
+                "recognition_status": "unmatched",
+                "recognition_confidence": 0.0,
+                "identity_manual_review": False,
+                "recognized_text": f"Identity mismatch: Extracted name '{extracted_name}' does not match backend '{backend_name_str}'."
+            }
+    else:
+        # Backend record had neither ID nor name
+        return {
+            "recognition_status": "unverified",
+            "recognition_confidence": 50.0,
+            "identity_manual_review": True,
+            "recognized_text": "Unverified: No authoritative ID or name was provided by PHP backend to verify document identity against."
+        }
 
 
 FORBIDDEN_PLACEHOLDER_SUBSTRINGS = [
@@ -1478,7 +1717,8 @@ def evaluate_student_booklet_ai(
     subject_title: str,
     discrepancy: Optional[str] = None,
     client: Optional[OpenAI] = None,
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-4o-mini",
+    backend_student: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Evaluate an individual student booklet against authoritative questions and answer key.
@@ -1486,7 +1726,7 @@ def evaluate_student_booklet_ai(
     - Decouples student identification from answer grading.
     - Accurately counts: total_questions, attempted_questions, unanswered_questions,
       evaluated_questions, pending_review_questions.
-    - Strictly only passes student_name and student_id in POST response if detected on booklet.
+    - Strictly compares extracted identity against authoritative PHP backend identity.
     - Enforces step marking sum == question obtained marks.
     - Prevents placeholder strings and fabricated marks.
     """
@@ -1494,6 +1734,8 @@ def evaluate_student_booklet_ai(
     page_count = len(page_numbers)
     booklet_text = booklet.get("combined_text", "")
     booklet_idx = booklet.get("booklet_index", 1)
+
+    backend_rec = backend_student or booklet.get("backend_student") or booklet.get("expected_student")
 
     # 1. Collect high-resolution page images for all pages in this student's booklet
     vision_images = collect_booklet_images(booklet=booklet, default_file_path=file_path)
@@ -1503,7 +1745,10 @@ def evaluate_student_booklet_ai(
     )
 
     # Initial identity from text extraction
-    text_name, text_id, text_adm, text_roll, text_kuhs = extract_identity_from_document_text(booklet_text)
+    text_name, text_id, text_adm, text_roll, text_kuhs = extract_identity_from_document_text(
+        booklet_text,
+        backend_roster=[backend_rec] if backend_rec else None
+    )
     detected_student_name: Optional[str] = booklet.get("detected_name") or text_name
     detected_student_id: Optional[str] = booklet.get("detected_id") or text_id
     admission_no: str = booklet.get("detected_adm") or text_adm or ""
@@ -1521,7 +1766,7 @@ def evaluate_student_booklet_ai(
     evaluated_result: Optional[Dict[str, Any]] = None
     is_unverified = False
 
-    has_document_content = bool(vision_images or (booklet_text and booklet_text.strip()))
+    has_document_content = bool(vision_images or (booklet_text and booklet_text.strip()) or (client and booklet.get("page_numbers")))
 
     if client and (os.getenv("OPENAI_API_KEY") or hasattr(client, "chat")) and has_document_content:
         system_prompt = (
@@ -1558,10 +1803,11 @@ def evaluate_student_booklet_ai(
             "   - If evaluation is unsuccessful or handwriting is unreadable, report that evaluation could not be completed and manual review is required; NEVER generate positive feedback for failed evaluations.\n\n"
             "5. INDEPENDENT IDENTITY EXTRACTION (PRINTED & HANDWRITTEN):\n"
             "   - Inspect the cover page, candidate information block, and top header of the answer sheet for student identity.\n"
-            "   - Support identity label variations: Student Name, Candidate Name, Name of Student, Name of Candidate, Student ID, Student Number, Student No., Candidate ID, Candidate Number, Roll Number, Roll No., Admission Number, Admission No., Register Number, Reg No., Registration Number, KUHS Registration Number.\n"
-            "   - Preserve exact ID characters: preserve leading zeros (e.g. '0042'), meaningful letters, hyphens, and slashes.\n"
-            "   - DO NOT invent missing characters or guess an unreadable ID.\n"
-            "   - If identity is ambiguous, blurred, or partially decipherable: set recognition_status = 'unverified', recognition_confidence = 50.0, and identity_manual_review = true.\n"
+            "   - Extract student codes even when written without labels, including alphanumeric values containing hyphens and slashes (such as AKN-25/1110/).\n"
+            "   - Continue supporting labeled identity variations: Student Name, Candidate Name, Name of Student, Student ID, Student Number, Candidate ID, Roll Number, Roll No., Admission Number, Register Number, KUHS Registration Number.\n"
+            "   - Preserve exact ID characters: preserve leading zeros (e.g. '0042'), letters, hyphens, and slashes. Do not silently remove or normalize meaningful characters.\n"
+            "   - DO NOT mistake question numbers, dates (e.g. 14/10/2026), marks (e.g. 100/100), or subject codes for student IDs.\n"
+            "   - If multiple plausible codes are found without clear disambiguation, or handwriting is ambiguous: set recognition_status = 'unverified', recognition_confidence = 50.0, and identity_manual_review = true.\n"
             "   - If NO identity is visibly present on this booklet, return null for name and ID and set recognition_status = 'unmatched'.\n"
             "   - Grade all readable answers fully regardless of whether student identity is detected!\n\n"
             "Output strictly valid JSON matching the schema."
@@ -1989,37 +2235,37 @@ Return a single JSON object with this EXACT schema:
             "strengths": strengths
         }
 
-    # STRICT IDENTITY ENFORCEMENT FOR POST RESPONSE:
-    has_name = bool(detected_student_name and str(detected_student_name).strip())
-    has_id = bool(detected_student_id and str(detected_student_id).strip())
+    # STRICT IDENTITY MATCHING WITH PHP BACKEND:
+    match_result = match_student_identity_with_backend(
+        extracted_id=detected_student_id,
+        extracted_name=detected_student_name,
+        backend_record=backend_rec,
+        extracted_roll=roll_no,
+        extracted_adm=admission_no,
+        extracted_kuhs=kuhs_reg_no,
+        is_unverified=is_unverified
+    )
+    rec_status = match_result["recognition_status"]
+    rec_conf = match_result["recognition_confidence"]
+    identity_manual_review = match_result["identity_manual_review"]
+    recognized_text_str = match_result["recognized_text"]
 
-    if has_name or has_id:
-        final_student_name = str(detected_student_name).strip() if has_name else ""
-        raw_id_str = str(detected_student_id).strip() if has_id else ""
+    if rec_status in ("matched", "unverified"):
+        final_student_name = str(detected_student_name).strip() if detected_student_name else ""
+        raw_id_str = str(detected_student_id).strip() if detected_student_id else ""
         # Preserve leading zeros! If raw_id_str has leading zeros (e.g. '0042', '0123') or is non-digit, keep as str!
-        if has_id and raw_id_str.isdigit() and not (len(raw_id_str) > 1 and raw_id_str.startswith("0")):
+        if detected_student_id and raw_id_str.isdigit() and not (len(raw_id_str) > 1 and raw_id_str.startswith("0")):
             final_student_id: Union[str, int] = int(raw_id_str)
         else:
             final_student_id = raw_id_str
-
-        if is_unverified:
-            rec_status = "unverified"
-            rec_conf = 50.0
-            recognized_text_str = f"Unverified: {final_student_name}" + (f" (ID: {final_student_id})" if final_student_id else "") + " - Flagged for manual review"
-        else:
-            rec_status = "matched"
-            rec_conf = 98.5
-            recognized_text_str = f"Recognized: {final_student_name}" + (f" (ID: {final_student_id})" if final_student_id else "")
     else:
+        # Strictly guarantee no identity from PHP backend is exposed as if extracted from document
         final_student_name = ""
         final_student_id = ""
         admission_no = ""
         roll_no = ""
         kuhs_reg_no = ""
         student_image = ""
-        rec_status = "unmatched"
-        rec_conf = 0.0
-        recognized_text_str = ""
 
     # Page metadata
     pages_meta = [
@@ -2049,7 +2295,11 @@ Return a single JSON object with this EXACT schema:
         "pages_json": json.dumps(pages_meta),
         "recognition_status": rec_status,
         "recognition_confidence": rec_conf,
-        "identity_manual_review": (rec_status == "unverified"),
+        "identity_manual_review": identity_manual_review,
+        "backend_student_id": backend_rec.get("student_id") if backend_rec else None,
+        "backend_student_name": backend_rec.get("student_name") if backend_rec else None,
+        "extracted_student_id": detected_student_id,
+        "extracted_student_name": detected_student_name,
         "total_questions": total_q_count,
         "attempted_questions": attempted_q_count,
         "unanswered_questions": unanswered_q_count,
@@ -2181,7 +2431,63 @@ def process_paper_evaluation(
         if not subject_name:
             subject_name = parsed_title or "Curriculum Assessment"
 
-        # 3. Disregard incoming student identity sent by PHP backend; only retrieve identity written in PDF/image
+        # 3. Preserve authoritative student identity from PHP backend for verification
+        backend_roster = payload.get("_backend_roster")
+        if not backend_roster:
+            backend_roster = []
+            raw_students = payload.get("students") or payload.get("answer_sheets") or payload.get("papers") or []
+            if isinstance(raw_students, dict):
+                raw_students = list(raw_students.values())
+            if isinstance(raw_students, list) and raw_students:
+                for idx, s in enumerate(raw_students):
+                    if isinstance(s, dict):
+                        s_id = (
+                            s.get("student_id")
+                            or s.get("id")
+                            or s.get("admission_no")
+                            or s.get("adm_no")
+                            or s.get("roll_no")
+                            or s.get("roll_number")
+                            or s.get("reg_no")
+                            or s.get("registration_no")
+                            or s.get("kuhs_reg_no")
+                        )
+                        s_name = s.get("student_name") or s.get("name")
+                        backend_roster.append({
+                            "index": idx + 1,
+                            "student_id": str(s_id).strip() if s_id is not None and str(s_id).strip() else None,
+                            "student_name": str(s_name).strip() if s_name is not None and str(s_name).strip() else None,
+                            "admission_no": str(s.get("admission_no") or s.get("adm_no") or "").strip(),
+                            "roll_no": str(s.get("roll_no") or s.get("roll_number") or "").strip(),
+                            "kuhs_reg_no": str(s.get("kuhs_reg_no") or "").strip(),
+                            "file_path": s.get("file_path", "")
+                        })
+            if not backend_roster:
+                top_id = (
+                    payload.get("student_id")
+                    or payload.get("id")
+                    or payload.get("admission_no")
+                    or payload.get("adm_no")
+                    or payload.get("roll_no")
+                    or payload.get("roll_number")
+                    or payload.get("reg_no")
+                    or payload.get("registration_no")
+                    or payload.get("kuhs_reg_no")
+                )
+                top_name = payload.get("student_name") or payload.get("name")
+                if top_id is not None or top_name is not None:
+                    backend_roster.append({
+                        "index": 1,
+                        "student_id": str(top_id).strip() if top_id is not None and str(top_id).strip() else None,
+                        "student_name": str(top_name).strip() if top_name is not None and str(top_name).strip() else None,
+                        "admission_no": str(payload.get("admission_no") or payload.get("adm_no") or "").strip(),
+                        "roll_no": str(payload.get("roll_no") or payload.get("roll_number") or "").strip(),
+                        "kuhs_reg_no": str(payload.get("kuhs_reg_no") or "").strip(),
+                        "file_path": payload.get("file_path", "")
+                    })
+
+        # Disregard incoming student identity sent by PHP backend in document evaluation working copy;
+        # document-extracted identity will remain independently recorded.
         IDENTITY_FIELDS = [
             "student_name", "student_id", "name", "id", "admission_no", "adm_no",
             "roll_no", "roll_number", "kuhs_reg_no", "reg_no", "registration_no",
@@ -2269,6 +2575,18 @@ def process_paper_evaluation(
                     model=model
                 )
                 for idx, b in enumerate(detected_booklets, start=1):
+                    expected_for_b = None
+                    if backend_roster:
+                        b_det_id = b.get("detected_id") or b.get("detected_roll")
+                        if b_det_id:
+                            norm_b_id = normalize_id_for_comparison(b_det_id)
+                            for s_entry in backend_roster:
+                                if s_entry.get("student_id") and normalize_id_for_comparison(s_entry["student_id"]) == norm_b_id:
+                                    expected_for_b = s_entry
+                                    break
+                        if not expected_for_b and idx <= len(backend_roster):
+                            expected_for_b = backend_roster[idx - 1]
+
                     student_res = evaluate_student_booklet_ai(
                         booklet=b,
                         file_path=resolved_pdf,
@@ -2278,7 +2596,8 @@ def process_paper_evaluation(
                         subject_title=subject_name,
                         discrepancy=discrepancy,
                         client=client,
-                        model=model
+                        model=model,
+                        backend_student=expected_for_b
                     )
                     student_res["id"] = idx
                     evaluated_students.append(student_res)
@@ -2311,6 +2630,13 @@ def process_paper_evaluation(
                     "file_path": f_path,
                     "file_name": f_name
                 }
+                expected_for_s = None
+                if backend_roster:
+                    if idx <= len(backend_roster):
+                        expected_for_s = backend_roster[idx - 1]
+                    else:
+                        expected_for_s = backend_roster[0]
+
                 student_res = evaluate_student_booklet_ai(
                     booklet=booklet_obj,
                     file_path=f_path,
@@ -2320,7 +2646,8 @@ def process_paper_evaluation(
                     subject_title=subject_name,
                     discrepancy=discrepancy,
                     client=client,
-                    model=model
+                    model=model,
+                    backend_student=expected_for_s
                 )
                 student_res["id"] = idx
                 evaluated_students.append(student_res)
@@ -2370,7 +2697,7 @@ def process_paper_evaluation(
                 "focus_areas": s["ai_insights"].get("focus_areas", []) if isinstance(s.get("ai_insights"), dict) else []
             }
             record_id = s.get("id") or idx
-            is_extracted = (s.get("recognition_status") == "matched") and bool(s.get("student_name") or s.get("student_id"))
+            is_extracted = (s.get("recognition_status") in ("matched", "unverified")) and bool(s.get("student_name") or s.get("student_id"))
             get_students_list.append({
                 "id": str(record_id),
                 "evaluation_id": str(eval_id),
@@ -2381,7 +2708,7 @@ def process_paper_evaluation(
                 "kuhs_reg_no": str(s.get("kuhs_reg_no", "")) if is_extracted else "",
                 "student_image": s.get("student_image", "") if is_extracted else "",
                 "recognized_text": s.get("recognized_text", "") if is_extracted else "",
-                "recognition_status": "matched" if is_extracted else "unmatched",
+                "recognition_status": s.get("recognition_status", "unmatched") if is_extracted else "unmatched",
                 "recognition_confidence": s.get("recognition_confidence", 0.0) if is_extracted else 0.0,
                 "file_name": s.get("file_name", ""),
                 "file_path": s.get("file_path", ""),
