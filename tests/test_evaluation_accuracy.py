@@ -27,6 +27,7 @@ from paper_evaluator import (
     extract_identity_from_document_text,
     normalize_extracted_text,
     detect_booklet_boundaries,
+    match_student_identity_with_backend,
 )
 
 
@@ -843,6 +844,534 @@ class TestPaperEvaluationAccuracy(unittest.TestCase):
         self.assertEqual(res["student_name"], "Rahul Verma")
         self.assertEqual(res["student_id"], 101)
         self.assertEqual(res["recognition_status"], "matched")
+
+    def test_18_handwritten_code_matches_php_record(self):
+        """Regression Test 1: A handwritten student code that matches the PHP record."""
+        # Answer booklet has handwritten code 'AKN-25/1110/' in header
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": "",
+            "detected_adm": "AKN-25/1110/",
+            "detected_id": "AKN-25/1110/"
+        }
+        # PHP backend supplies authoritative student record with DB id=1 and admission_no='AKN-25/1110/'
+        backend_rec = {
+            "student_id": 1,
+            "admission_no": "AKN-25/1110/",
+            "student_name": "AADHISREE M L"
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": None,
+            "detected_admission_no": "AKN-25/1110/",
+            "detected_student_id": "AKN-25/1110/",
+            "recognition_status": "matched",
+            "recognition_confidence": 98.0,
+            "identity_manual_review": False,
+            "ai_feedback": "Accurate explanation of pathophysiology.",
+            "ai_insights": {"recommendation": "Great understanding.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 10.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Homeostasis maintains internal physiological equilibrium.",
+                    "step_marking": [
+                        {"step": "Plaque rupture & thrombus", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"},
+                        {"step": "Occlusion & necrosis", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"}
+                    ]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            backend_rec=backend_rec,
+            client=mock_client
+        )
+        self.assertEqual(res["recognition_status"], "matched")
+        self.assertGreaterEqual(res["recognition_confidence"], 95.0)
+        self.assertFalse(res["identity_manual_review"])
+        self.assertEqual(res["admission_no"], "AKN-25/1110/")
+        self.assertEqual(res["evaluation_breakdown"][0]["obtained_marks"], 10.0)
+        self.assertTrue(res["evaluation_breakdown"][0]["is_attempted"])
+        self.assertFalse(res["evaluation_breakdown"][0]["pending_review"])
+
+    def test_19_handwritten_code_differs_from_php_record(self):
+        """Regression Test 2: A handwritten code that differs from the PHP record."""
+        # Answer booklet has handwritten code 'AKN-25/1110/'
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": "",
+            "detected_adm": "AKN-25/1110/",
+            "detected_id": "AKN-25/1110/"
+        }
+        # PHP backend authoritative record expects 'AKN-25/1067'
+        backend_rec = {
+            "student_id": 1,
+            "admission_no": "AKN-25/1067",
+            "student_name": "AADHISREE M L"
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": None,
+            "detected_admission_no": "AKN-25/1110/",
+            "detected_student_id": "AKN-25/1110/",
+            "recognition_status": "unmatched",
+            "recognition_confidence": 0.0,
+            "identity_manual_review": False,
+            "ai_feedback": "Evaluated handwritten answers.",
+            "ai_insights": {"recommendation": "Review cardiology.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 9.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture triggers thrombosis and myocardial necrosis.",
+                    "step_marking": [
+                        {"step": "Plaque rupture & thrombus", "max_marks": 5.0, "obtained_marks": 4.5, "status": "Partial"},
+                        {"step": "Occlusion & necrosis", "max_marks": 5.0, "obtained_marks": 4.5, "status": "Partial"}
+                    ]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            backend_rec=backend_rec,
+            client=mock_client
+        )
+        # Must be unmatched because AKN-25/1110/ != AKN-25/1067
+        self.assertEqual(res["recognition_status"], "unmatched")
+        self.assertEqual(res["recognition_confidence"], 0.0)
+        # Authoritative backend student name 'AADHISREE M L' must NOT be leaked
+        self.assertNotEqual(res["student_name"], "AADHISREE M L")
+        self.assertEqual(res["admission_no"], "AKN-25/1110/")
+        self.assertIn("mismatch", res["recognized_text"].lower())
+        # Grading continues independently
+        self.assertEqual(res["obtained_marks"], 9.0)
+
+    def test_20_student_name_and_code_both_readable(self):
+        """Regression Test 3: A student name and code that are both readable."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": "Student Name: Pooja Nair\nAdmission No: AKN-25/2042\nQ1: Homeostasis..."
+        }
+        backend_rec = {
+            "student_id": 42,
+            "admission_no": "AKN-25/2042",
+            "student_name": "Pooja Nair"
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "Pooja Nair",
+            "detected_admission_no": "AKN-25/2042",
+            "detected_student_id": "AKN-25/2042",
+            "recognition_status": "matched",
+            "recognition_confidence": 99.0,
+            "identity_manual_review": False,
+            "ai_feedback": "Excellent response.",
+            "ai_insights": {"recommendation": "Maintain consistency.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 10.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture triggers coronary thrombosis.",
+                    "step_marking": [
+                        {"step": "Plaque rupture & thrombus", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"},
+                        {"step": "Occlusion & necrosis", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"}
+                    ]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            backend_rec=backend_rec,
+            client=mock_client
+        )
+        self.assertEqual(res["recognition_status"], "matched")
+        self.assertEqual(res["student_name"], "Pooja Nair")
+        self.assertEqual(res["admission_no"], "AKN-25/2042")
+        self.assertGreaterEqual(res["recognition_confidence"], 98.0)
+        self.assertFalse(res["identity_manual_review"])
+
+    def test_21_unreadable_or_ambiguous_code(self):
+        """Regression Test 4: An unreadable or ambiguous code."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": ""
+        }
+        backend_rec = {
+            "student_id": 1,
+            "admission_no": "AKN-25/1067",
+            "student_name": "AADHISREE M L"
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": None,
+            "detected_admission_no": "AKN-25/???",
+            "detected_student_id": "AKN-25/???",
+            "recognition_status": "unverified",
+            "recognition_confidence": 50.0,
+            "identity_manual_review": True,
+            "ai_feedback": "Header student code is smudged.",
+            "ai_insights": {"recommendation": "Review cover page.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 8.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture triggers thrombosis.",
+                    "step_marking": [
+                        {"step": "Plaque rupture & thrombus", "max_marks": 5.0, "obtained_marks": 4.0, "status": "Partial"},
+                        {"step": "Occlusion & necrosis", "max_marks": 5.0, "obtained_marks": 4.0, "status": "Partial"}
+                    ]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            backend_rec=backend_rec,
+            client=mock_client
+        )
+        self.assertEqual(res["recognition_status"], "unverified")
+        self.assertEqual(res["recognition_confidence"], 50.0)
+        self.assertTrue(res["identity_manual_review"])
+        self.assertIn("manual review", res["recognized_text"].lower())
+
+    def test_22_correct_handwritten_answer_closely_matching_model_answer(self):
+        """Regression Test 5: A correct handwritten answer closely matching the model answer is NOT flagged as duplicate."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": "Q1: Plaque rupture leading to thrombus formation, coronary artery occlusion, and myocardial necrosis."
+        }
+        # Student writes textbook explanation that closely follows model answer
+        student_text = "Plaque rupture leading to thrombus formation, coronary artery occlusion, and myocardial necrosis."
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "Pooja Nair",
+            "detected_student_id": "AKN-25/2042",
+            "recognition_status": "matched",
+            "recognition_confidence": 98.0,
+            "identity_manual_review": False,
+            "ai_feedback": "Perfect explanation.",
+            "ai_insights": {"recommendation": "Excellent.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 10.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": student_text,
+                    "step_marking": [
+                        {"step": "Plaque rupture & thrombus", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"},
+                        {"step": "Occlusion & necrosis", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"}
+                    ],
+                    "feedback": "Flawless description matching pathophysiology criteria."
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        q1 = res["evaluation_breakdown"][0]
+        # Must NOT be flagged as duplicated answer key!
+        self.assertNotIn("Answer key duplication detected", q1["student_response"])
+        self.assertEqual(q1["obtained_marks"], 10.0)
+        self.assertTrue(q1["is_attempted"])
+        self.assertFalse(q1["pending_review"])
+
+    def test_23_answer_genuinely_missing(self):
+        """Regression Test 6: An answer that is genuinely missing has is_attempted=False, marks=0.0."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": "Q1: Plaque rupture triggers myocardial necrosis."
+        }
+        # Student answered Q1 but omitted Q2
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "Pooja Nair",
+            "detected_student_id": "AKN-25/2042",
+            "recognition_status": "matched",
+            "recognition_confidence": 98.0,
+            "ai_feedback": "Evaluated.",
+            "ai_insights": {"recommendation": "Answer all questions.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 8.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture triggers myocardial necrosis.",
+                    "step_marking": [
+                        {"step": "Plaque rupture & thrombus", "max_marks": 5.0, "obtained_marks": 4.0, "status": "Partial"},
+                        {"step": "Occlusion & necrosis", "max_marks": 5.0, "obtained_marks": 4.0, "status": "Partial"}
+                    ]
+                },
+                {
+                    "question_no": 2,
+                    "max_marks": 5.0,
+                    "obtained_marks": 0.0,
+                    "is_attempted": False,
+                    "pending_review": False,
+                    "student_response": "[Unanswered]",
+                    "feedback": "Question 2 was not attempted by the student."
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=self.sample_questions,
+            total_marks=15.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        q2 = res["evaluation_breakdown"][1]
+        self.assertFalse(q2["is_attempted"])
+        self.assertFalse(q2["pending_review"])
+        self.assertEqual(q2["obtained_marks"], 0.0)
+        self.assertEqual(q2["student_response"], "[Unanswered]")
+        self.assertEqual(res["attempted_questions"], 1)
+        self.assertEqual(res["unanswered_questions"], 1)
+        self.assertEqual(res["total_questions"], 2)
+
+    def test_24_answer_present_on_later_page(self):
+        """Regression Test 7: Multi-page answer continuation across pages."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1, 2],
+            "combined_text": "Page 1: Plaque rupture in coronary artery...\nPage 2: ...leads to occlusion, ischemia, and tissue necrosis."
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "Pooja Nair",
+            "detected_student_id": "AKN-25/2042",
+            "recognition_status": "matched",
+            "recognition_confidence": 98.0,
+            "ai_feedback": "Comprehensive multi-page answer.",
+            "ai_insights": {"recommendation": "Great work.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 10.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture in coronary artery leads to occlusion, ischemia, and tissue necrosis.",
+                    "step_marking": [
+                        {"step": "Plaque rupture & thrombus", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"},
+                        {"step": "Occlusion & necrosis", "max_marks": 5.0, "obtained_marks": 5.0, "status": "Full"}
+                    ]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        q1 = res["evaluation_breakdown"][0]
+        self.assertTrue(q1["is_attempted"])
+        self.assertFalse(q1["pending_review"])
+        self.assertEqual(q1["obtained_marks"], 10.0)
+        self.assertEqual(res["page_count"], 2)
+
+    def test_25_extraction_failure_flagged_for_review(self):
+        """Regression Test 8: An answer that cannot be located because of extraction failure is flagged for review (NOT unattempted)."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": ""
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "Pooja Nair",
+            "detected_student_id": "AKN-25/2042",
+            "recognition_status": "matched",
+            "recognition_confidence": 95.0,
+            "ai_feedback": "Page scan unreadable for Question 1.",
+            "ai_insights": {"recommendation": "Manual review required.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 0.0,
+                    "is_attempted": True,
+                    "pending_review": True,
+                    "student_response": "Extraction failed due to corrupted page scan.",
+                    "feedback": "Extraction failed for Question 1. Flagged for review.",
+                    "step_marking": [
+                        {"step": "Criteria", "max_marks": 10.0, "obtained_marks": 0.0, "status": "Zero"}
+                    ]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        q1 = res["evaluation_breakdown"][0]
+        # Must be treated as pending review, NOT as an unattempted question!
+        self.assertTrue(q1["pending_review"])
+        self.assertTrue(q1["is_attempted"])
+        self.assertEqual(q1["obtained_marks"], 0.0)
+        self.assertIn("Extraction failure", q1["student_response"])
+        self.assertEqual(res["pending_review_questions"], 1)
+        self.assertEqual(res["evaluated_questions"], 0)
+
+    def test_26_multistudent_pdf_different_identities(self):
+        """Regression Test 9: A multi-student PDF with different identities segmented and matched correctly."""
+        p1 = "Admission No: AKN-25/1110/\nCandidate: Student Alpha\nQ1: MI answer"
+        p2 = "Page 2: continuation of Alpha"
+        p3 = "Admission No: AKN-25/2042\nCandidate: Student Beta\nQ1: MI answer"
+        p4 = "Page 2: continuation of Beta"
+
+        mock_pages = [
+            MagicMock(extract_text=MagicMock(return_value=p1), extract_tables=MagicMock(return_value=[])),
+            MagicMock(extract_text=MagicMock(return_value=p2), extract_tables=MagicMock(return_value=[])),
+            MagicMock(extract_text=MagicMock(return_value=p3), extract_tables=MagicMock(return_value=[])),
+            MagicMock(extract_text=MagicMock(return_value=p4), extract_tables=MagicMock(return_value=[])),
+        ]
+        mock_pdf = MagicMock(pages=mock_pages)
+        mock_pdf.__enter__.return_value = mock_pdf
+
+        with patch("pdfplumber.open", return_value=mock_pdf):
+            booklets = detect_booklet_boundaries("dummy.pdf")
+
+        self.assertEqual(len(booklets), 2)
+        self.assertEqual(booklets[0]["detected_adm"], "AKN-25/1110/")
+        self.assertEqual(booklets[1]["detected_adm"], "AKN-25/2042")
+        # Identities must remain independent and not cross-contaminate
+        self.assertNotEqual(booklets[0]["detected_adm"], booklets[1]["detected_adm"])
+
+    def test_27_pending_review_and_consistent_metrics(self):
+        """Regression Test 10: Consistent evaluation metrics with mixed attempted, pending-review, and unanswered questions."""
+        three_questions = [
+            {"question_no": 1, "question_text": "Q1", "max_marks": 10.0, "model_answer": "Key 1"},
+            {"question_no": 2, "question_text": "Q2", "max_marks": 5.0, "model_answer": "Key 2"},
+            {"question_no": 3, "question_text": "Q3", "max_marks": 5.0, "model_answer": "Key 3"}
+        ]
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": "Q1 answered, Q2 blurred handwriting, Q3 blank"
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "Pooja Nair",
+            "detected_student_id": "AKN-25/2042",
+            "recognition_status": "matched",
+            "recognition_confidence": 95.0,
+            "ai_feedback": "Partial evaluation completed.",
+            "ai_insights": {"recommendation": "Review pending questions.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 10.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Complete correct answer for Q1.",
+                    "step_marking": [{"step": "Criteria", "max_marks": 10.0, "obtained_marks": 10.0, "status": "Full"}]
+                },
+                {
+                    "question_no": 2,
+                    "max_marks": 5.0,
+                    "obtained_marks": 0.0,
+                    "is_attempted": True,
+                    "pending_review": True,
+                    "student_response": "[Illegible handwriting - Flagged for manual review]",
+                    "feedback": "Handwriting is smudged."
+                },
+                {
+                    "question_no": 3,
+                    "max_marks": 5.0,
+                    "obtained_marks": 0.0,
+                    "is_attempted": False,
+                    "pending_review": False,
+                    "student_response": "[Unanswered]",
+                    "feedback": "Not attempted."
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=three_questions,
+            total_marks=20.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        # Invariants enforcement:
+        # total_questions = attempted_questions + unanswered_questions
+        self.assertEqual(res["total_questions"], res["attempted_questions"] + res["unanswered_questions"])
+        self.assertEqual(res["total_questions"], 3)
+        self.assertEqual(res["attempted_questions"], 2)
+        self.assertEqual(res["unanswered_questions"], 1)
+
+        # attempted_questions = evaluated_questions + pending_review_questions
+        self.assertEqual(res["attempted_questions"], res["evaluated_questions"] + res["pending_review_questions"])
+        self.assertEqual(res["evaluated_questions"], 1)
+        self.assertEqual(res["pending_review_questions"], 1)
+
+        # Marks and totals
+        self.assertEqual(res["total_marks"], 20.0)
+        self.assertEqual(res["obtained_marks"], 10.0)
+        self.assertEqual(res["percentage"], 50.0)
+        self.assertEqual(res["status"], "Pass")
 
 
 if __name__ == "__main__":

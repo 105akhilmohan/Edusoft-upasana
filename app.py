@@ -1864,13 +1864,33 @@ def evaluate_papers():
                 or (raw_body.get("payload", {}).get("student_name") if isinstance(raw_body.get("payload"), dict) else None)
             )
             if top_id is not None or top_name is not None:
+                raw_adm = (
+                    payload.get("admission_no")
+                    or payload.get("adm_no")
+                    or (raw_body.get("data", {}).get("admission_no") if isinstance(raw_body.get("data"), dict) else None)
+                    or (raw_body.get("payload", {}).get("admission_no") if isinstance(raw_body.get("payload"), dict) else None)
+                    or ""
+                )
+                raw_roll = (
+                    payload.get("roll_no")
+                    or payload.get("roll_number")
+                    or (raw_body.get("data", {}).get("roll_no") if isinstance(raw_body.get("data"), dict) else None)
+                    or (raw_body.get("payload", {}).get("roll_no") if isinstance(raw_body.get("payload"), dict) else None)
+                    or ""
+                )
+                raw_kuhs = (
+                    payload.get("kuhs_reg_no")
+                    or (raw_body.get("data", {}).get("kuhs_reg_no") if isinstance(raw_body.get("data"), dict) else None)
+                    or (raw_body.get("payload", {}).get("kuhs_reg_no") if isinstance(raw_body.get("payload"), dict) else None)
+                    or ""
+                )
                 backend_roster.append({
                     "index": 1,
                     "student_id": str(top_id).strip() if top_id is not None and str(top_id).strip() else None,
                     "student_name": str(top_name).strip() if top_name is not None and str(top_name).strip() else None,
-                    "admission_no": str(payload.get("admission_no") or payload.get("adm_no") or "").strip(),
-                    "roll_no": str(payload.get("roll_no") or payload.get("roll_number") or "").strip(),
-                    "kuhs_reg_no": str(payload.get("kuhs_reg_no") or "").strip(),
+                    "admission_no": str(raw_adm).strip(),
+                    "roll_no": str(raw_roll).strip(),
+                    "kuhs_reg_no": str(raw_kuhs).strip(),
                     "file_path": payload.get("file_path", "")
                 })
 
@@ -1909,26 +1929,22 @@ def evaluate_papers():
             default_model=DEFAULT_MODEL
         )
 
-        # Safeguard: Strictly guarantee no static name from PHP is returned when unmatched on the document
+        # Safeguard: Ensure document-extracted identity fields and recognized_text are consistently formatted
         if isinstance(response_data, dict) and "students" in response_data and isinstance(response_data["students"], list):
             for s in response_data["students"]:
                 if isinstance(s, dict):
-                    is_matched = (s.get("recognition_status") in ("matched", "unverified")) and bool(s.get("student_name") or s.get("student_id"))
-                    if not is_matched:
+                    if not s.get("student_name"):
                         s["student_name"] = ""
+                    if not s.get("student_id"):
                         s["student_id"] = ""
+                    if not s.get("admission_no"):
                         s["admission_no"] = ""
+                    if not s.get("roll_no"):
                         s["roll_no"] = ""
+                    if not s.get("kuhs_reg_no"):
                         s["kuhs_reg_no"] = ""
+                    if not s.get("student_image"):
                         s["student_image"] = ""
-                        s["recognized_text"] = ""
-                        s["recognition_status"] = "unmatched"
-                        s["recognition_confidence"] = 0.0
-                    else:
-                        if not s.get("student_name"):
-                            s["student_name"] = ""
-                        if not s.get("student_id"):
-                            s["student_id"] = ""
 
         return jsonify(response_data), status_code
 
@@ -1988,16 +2004,18 @@ def get_evaluation_by_id(evaluation_id):
         if "students" in record["data"] and isinstance(record["data"]["students"], list):
             for s in record["data"]["students"]:
                 if isinstance(s, dict):
-                    if s.get("recognition_status") not in ("matched", "unverified") or not (s.get("student_name") or s.get("student_id")):
+                    if not s.get("student_name"):
                         s["student_name"] = ""
+                    if not s.get("student_id"):
                         s["student_id"] = ""
+                    if not s.get("admission_no"):
                         s["admission_no"] = ""
+                    if not s.get("roll_no"):
                         s["roll_no"] = ""
+                    if not s.get("kuhs_reg_no"):
                         s["kuhs_reg_no"] = ""
+                    if not s.get("student_image"):
                         s["student_image"] = ""
-                        s["recognized_text"] = ""
-                        s["recognition_status"] = "unmatched"
-                        s["recognition_confidence"] = 0.0
     return jsonify(record), 200
 
 
@@ -2018,16 +2036,18 @@ def get_evaluation_breakdown(evaluation_id):
     if isinstance(rec_copy, dict) and "students" in rec_copy and isinstance(rec_copy["students"], list):
         for s in rec_copy["students"]:
             if isinstance(s, dict):
-                if s.get("recognition_status") not in ("matched", "unverified") or not (s.get("student_name") or s.get("student_id")):
+                if not s.get("student_name"):
                     s["student_name"] = ""
+                if not s.get("student_id"):
                     s["student_id"] = ""
+                if not s.get("admission_no"):
                     s["admission_no"] = ""
+                if not s.get("roll_no"):
                     s["roll_no"] = ""
+                if not s.get("kuhs_reg_no"):
                     s["kuhs_reg_no"] = ""
+                if not s.get("student_image"):
                     s["student_image"] = ""
-                    s["recognized_text"] = ""
-                    s["recognition_status"] = "unmatched"
-                    s["recognition_confidence"] = 0.0
     return jsonify(rec_copy), 200
 
 
@@ -2046,16 +2066,18 @@ def get_student_evaluation_breakdown(evaluation_id, student_id):
         }), 404
     s_copy = json.loads(json.dumps(student_eval))
     if isinstance(s_copy, dict):
-        if s_copy.get("recognition_status") not in ("matched", "unverified") or not (s_copy.get("student_name") or s_copy.get("student_id")):
+        if not s_copy.get("student_name"):
             s_copy["student_name"] = ""
+        if not s_copy.get("student_id"):
             s_copy["student_id"] = ""
+        if not s_copy.get("admission_no"):
             s_copy["admission_no"] = ""
+        if not s_copy.get("roll_no"):
             s_copy["roll_no"] = ""
+        if not s_copy.get("kuhs_reg_no"):
             s_copy["kuhs_reg_no"] = ""
+        if not s_copy.get("student_image"):
             s_copy["student_image"] = ""
-            s_copy["recognized_text"] = ""
-            s_copy["recognition_status"] = "unmatched"
-            s_copy["recognition_confidence"] = 0.0
     return jsonify({
         "status": "success",
         "evaluation_id": evaluation_id,

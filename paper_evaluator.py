@@ -695,12 +695,15 @@ def _extract_ids_from_text(
         if found_candidates:
             # Check against backend roster if supplied
             if backend_roster:
-                roster_ids = {
-                    normalize_id_for_comparison(b.get("student_id")): b.get("student_id")
-                    for b in backend_roster if b.get("student_id")
-                }
+                roster_codes = {}
+                for b in backend_roster:
+                    if isinstance(b, dict):
+                        for field in ("admission_no", "adm_no", "roll_no", "roll_number", "kuhs_reg_no", "reg_no", "student_id", "id"):
+                            f_val = b.get(field)
+                            if f_val and str(f_val).strip():
+                                roster_codes[normalize_id_for_comparison(f_val)] = str(f_val).strip()
                 for c in found_candidates:
-                    if normalize_id_for_comparison(c) in roster_ids:
+                    if normalize_id_for_comparison(c) in roster_codes:
                         detected_id = c
                         break
 
@@ -820,14 +823,16 @@ def match_student_identity_with_backend(
     """
     Compare document-extracted student identity against authoritative PHP backend identity.
     - Preserves meaningful ID characters (leading zeros, hyphens, slashes).
+    - Keeps internal database record ID separate from student's admission number, roll number, and registration number.
     - Secondary validation against student name (case/whitespace insensitive).
-    - Rejects identity if extracted name conflicts with backend name.
-    - Flags ambiguous extraction for review.
-    - Never marks matched merely because an ID or name was extracted.
+    - Rejects identity if extracted code differs from authoritative backend code.
+    - Never marks matched merely because an ID, name, or confidence score was present.
+    - Logs which source supplied each identity field and match/mismatch rationale.
     """
     if not backend_record:
         # Standalone evaluation without backend verification record
         if is_unverified:
+            logger.info("Identity verification: Standalone evaluation, extraction is ambiguous. Status: unverified.")
             return {
                 "recognition_status": "unverified",
                 "recognition_confidence": 50.0,
@@ -835,6 +840,7 @@ def match_student_identity_with_backend(
                 "recognized_text": f"Unverified: Document identity {extracted_name or extracted_id or ''} is ambiguous. Flagged for manual review."
             }
         elif extracted_id or extracted_name:
+            logger.info("Identity verification: Standalone evaluation, document identity extracted. Status: matched.")
             return {
                 "recognition_status": "matched",
                 "recognition_confidence": 98.5,
@@ -842,6 +848,7 @@ def match_student_identity_with_backend(
                 "recognized_text": f"Extracted from document: {extracted_name or ''}" + (f" (ID: {extracted_id})" if extracted_id else "")
             }
         else:
+            logger.info("Identity verification: Standalone evaluation, no identity found on document. Status: unmatched.")
             return {
                 "recognition_status": "unmatched",
                 "recognition_confidence": 0.0,
@@ -849,77 +856,108 @@ def match_student_identity_with_backend(
                 "recognized_text": "No student identity found on document."
             }
 
-    backend_id = (
-        backend_record.get("student_id")
-        or backend_record.get("id")
-        or backend_record.get("roll_no")
-        or backend_record.get("admission_no")
-        or backend_record.get("reg_no")
-        or backend_record.get("kuhs_reg_no")
-    )
+    # Extract backend fields keeping internal database ID distinct from student institutional codes
+    backend_internal_id = backend_record.get("student_id") or backend_record.get("id")
+    backend_adm = backend_record.get("admission_no") or backend_record.get("adm_no")
+    backend_roll = backend_record.get("roll_no") or backend_record.get("roll_number")
+    backend_kuhs = backend_record.get("kuhs_reg_no") or backend_record.get("reg_no") or backend_record.get("registration_no")
     backend_name = backend_record.get("student_name") or backend_record.get("name")
 
-    backend_id_str = str(backend_id).strip() if backend_id is not None and str(backend_id).strip() else None
+    # Collect authoritative backend student codes
+    backend_codes: List[Tuple[str, str]] = []
+    if backend_adm and str(backend_adm).strip():
+        backend_codes.append(("admission_no", str(backend_adm).strip()))
+    if backend_roll and str(backend_roll).strip():
+        backend_codes.append(("roll_no", str(backend_roll).strip()))
+    if backend_kuhs and str(backend_kuhs).strip():
+        backend_codes.append(("kuhs_reg_no", str(backend_kuhs).strip()))
+
+    # If backend provided no separate admission/roll/reg number, fallback to student_id if present
+    if not backend_codes and backend_internal_id and str(backend_internal_id).strip():
+        backend_codes.append(("student_id", str(backend_internal_id).strip()))
+    elif backend_internal_id and str(backend_internal_id).strip():
+        # If student_id is alphanumeric or has leading zeros (e.g. '0042', 'AKN-25/1067'), also accept it as candidate
+        s_id_str = str(backend_internal_id).strip()
+        if not s_id_str.isdigit() or (len(s_id_str) > 1 and s_id_str.startswith("0")):
+            backend_codes.append(("student_id", s_id_str))
+
     backend_name_str = str(backend_name).strip() if backend_name is not None and str(backend_name).strip() else None
 
-    # If extraction on document was ambiguous, smudged, or multiple conflicting codes found
+    # Collect document-extracted candidate codes
+    doc_candidate_ids: List[str] = []
+    for c in [extracted_id, extracted_adm, extracted_roll, extracted_kuhs]:
+        if c is not None and str(c).strip():
+            c_str = str(c).strip()
+            if c_str not in doc_candidate_ids:
+                doc_candidate_ids.append(c_str)
+
+    # 1. Ambiguous or smudged extraction
     if is_unverified:
+        logger.info(
+            f"Identity verification: Document extraction is ambiguous or unverified against backend record "
+            f"(backend_codes={len(backend_codes)}, backend_name={'present' if backend_name_str else 'none'}). Status: unverified."
+        )
         return {
             "recognition_status": "unverified",
             "recognition_confidence": 50.0,
             "identity_manual_review": True,
-            "recognized_text": f"Unverified document identity: Extracted data is ambiguous or partially decipherable against backend record ({backend_id_str or backend_name_str}). Flagged for manual review."
+            "recognized_text": "Unverified document identity: Extracted data is ambiguous or partially decipherable. Flagged for manual review."
         }
 
-    # If nothing was extracted from the document
-    if not extracted_id and not extracted_name and not extracted_roll and not extracted_adm:
+    # 2. No student identity found on document
+    if not doc_candidate_ids and not extracted_name:
+        logger.info("Identity verification: No student code or name found on answer sheet. Status: unmatched.")
         return {
             "recognition_status": "unmatched",
             "recognition_confidence": 0.0,
             "identity_manual_review": False,
-            "recognized_text": f"No student identity detected on answer sheet. Unmatched against backend record ({backend_id_str or backend_name_str})."
+            "recognized_text": "No student identity detected on answer sheet. Unmatched against backend record."
         }
 
-    # Compare ID
-    id_matched = False
-    if backend_id_str:
-        norm_b_id = normalize_id_for_comparison(backend_id_str)
-        candidate_ids = [c for c in [extracted_id, extracted_roll, extracted_adm, extracted_kuhs] if c]
-        for cid in candidate_ids:
-            if normalize_id_for_comparison(cid) == norm_b_id:
-                id_matched = True
+    # 3. Check for matching code
+    matched_code_pair: Optional[Tuple[str, str]] = None
+    if backend_codes and doc_candidate_ids:
+        for doc_c in doc_candidate_ids:
+            norm_doc_c = normalize_id_for_comparison(doc_c)
+            for b_type, b_val in backend_codes:
+                if norm_doc_c == normalize_id_for_comparison(b_val):
+                    matched_code_pair = (doc_c, b_val)
+                    break
+            if matched_code_pair:
                 break
 
-    # Secondary validation: Compare Name
+    # Secondary validation: Name comparison
     name_matched: Optional[bool] = None
     if backend_name_str and extracted_name:
         norm_b_name = normalize_name_for_comparison(backend_name_str)
         norm_e_name = normalize_name_for_comparison(extracted_name)
-        if norm_b_name == norm_e_name:
-            name_matched = True
-        else:
-            name_matched = False
+        name_matched = (norm_b_name == norm_e_name)
 
     # Resolution logic:
-    if backend_id_str:
-        if id_matched:
-            # ID matched! Check secondary name validation
+    if backend_codes:
+        if matched_code_pair:
+            doc_c, b_val = matched_code_pair
             if name_matched is False:
-                # Name is explicitly different! Genuine conflict / mismatch
+                # Code matched but name explicitly conflicts
+                logger.warning(
+                    f"Identity verification: Code matched backend record ('{b_val}'), but extracted name "
+                    f"conflicts with backend student name. Setting status: unmatched."
+                )
                 return {
                     "recognition_status": "unmatched",
                     "recognition_confidence": 40.0,
                     "identity_manual_review": True,
                     "recognized_text": (
-                        f"Identity conflict: Extracted code '{extracted_id}' matches backend ID, "
-                        f"but extracted name '{extracted_name}' does not match backend student '{backend_name_str}'."
+                        f"Identity conflict: Extracted code '{doc_c}' matches backend record, "
+                        f"but extracted name '{extracted_name}' does not match backend student."
                     )
                 }
             else:
                 conf = 99.0 if (name_matched is True) else 98.0
-                rec_desc = f"Verified: Extracted code '{extracted_id}' matches PHP backend record '{backend_id_str}'"
+                rec_desc = f"Verified: Extracted code '{doc_c}' matches PHP backend record"
                 if name_matched is True:
-                    rec_desc += f" and name '{extracted_name}' is confirmed."
+                    rec_desc += " and student name is confirmed."
+                logger.info(f"Identity verification: Code '{doc_c}' matched backend record. Name confirmed={name_matched}. Status: matched.")
                 return {
                     "recognition_status": "matched",
                     "recognition_confidence": conf,
@@ -927,39 +965,47 @@ def match_student_identity_with_backend(
                     "recognized_text": rec_desc
                 }
         else:
-            # ID genuinely mismatched!
+            # Backend required code, but document code did not match
+            first_doc_c = doc_candidate_ids[0] if doc_candidate_ids else (extracted_name or "")
+            b_code_display = backend_codes[0][1] if backend_codes else ""
+            logger.info(
+                f"Identity verification: Document code '{first_doc_c}' does not match authoritative backend record '{b_code_display}'. "
+                f"Status: unmatched."
+            )
             return {
                 "recognition_status": "unmatched",
                 "recognition_confidence": 0.0,
                 "identity_manual_review": False,
                 "recognized_text": (
-                    f"Identity mismatch: Extracted code '{extracted_id or extracted_roll or ''}' "
-                    f"does not match authoritative PHP backend ID '{backend_id_str}'."
+                    f"Identity mismatch: Extracted code '{first_doc_c}' "
+                    f"does not match authoritative PHP backend record."
                 )
             }
     elif backend_name_str:
-        # Backend only supplied name
+        # Backend only provided name
         if name_matched is True:
+            logger.info("Identity verification: Extracted name matches backend name record. Status: matched.")
             return {
                 "recognition_status": "matched",
                 "recognition_confidence": 95.0,
                 "identity_manual_review": False,
-                "recognized_text": f"Verified: Extracted student name '{extracted_name}' matches PHP backend record."
+                "recognized_text": "Verified: Extracted student name matches PHP backend record."
             }
         else:
+            logger.info("Identity verification: Extracted name does not match backend name. Status: unmatched.")
             return {
                 "recognition_status": "unmatched",
                 "recognition_confidence": 0.0,
                 "identity_manual_review": False,
-                "recognized_text": f"Identity mismatch: Extracted name '{extracted_name}' does not match backend '{backend_name_str}'."
+                "recognized_text": "Identity mismatch: Extracted name does not match backend record."
             }
     else:
-        # Backend record had neither ID nor name
+        # Backend record had neither code nor name
         return {
             "recognition_status": "unverified",
             "recognition_confidence": 50.0,
             "identity_manual_review": True,
-            "recognized_text": "Unverified: No authoritative ID or name was provided by PHP backend to verify document identity against."
+            "recognized_text": "Unverified: No authoritative student code or name was provided by PHP backend to verify document identity against."
         }
 
 
@@ -1718,7 +1764,8 @@ def evaluate_student_booklet_ai(
     discrepancy: Optional[str] = None,
     client: Optional[OpenAI] = None,
     model: str = "gpt-4o-mini",
-    backend_student: Optional[Dict[str, Any]] = None
+    backend_student: Optional[Dict[str, Any]] = None,
+    backend_rec: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Evaluate an individual student booklet against authoritative questions and answer key.
@@ -1735,7 +1782,7 @@ def evaluate_student_booklet_ai(
     booklet_text = booklet.get("combined_text", "")
     booklet_idx = booklet.get("booklet_index", 1)
 
-    backend_rec = backend_student or booklet.get("backend_student") or booklet.get("expected_student")
+    backend_rec = backend_rec or backend_student or booklet.get("backend_student") or booklet.get("expected_student")
 
     # 1. Collect high-resolution page images for all pages in this student's booklet
     vision_images = collect_booklet_images(booklet=booklet, default_file_path=file_path)
@@ -1912,15 +1959,21 @@ Return a single JSON object with this EXACT schema:
                         and not any(w in ai_name.lower() for w in ["examination", "college", "university", "question", "subject"])
                     ):
                         detected_student_name = ai_name.strip()
-                        admission_no = str(parsed.get("detected_admission_no") or admission_no).strip()
-                        roll_no = str(parsed.get("detected_roll_no") or roll_no).strip()
-                        kuhs_reg_no = str(parsed.get("detected_kuhs_reg_no") or kuhs_reg_no).strip()
                     elif not detected_student_name and vision_images:
                         # Only clear if it was NOT already extracted from PDF text
                         detected_student_name = None
-                        admission_no = ""
-                        roll_no = ""
-                        kuhs_reg_no = ""
+
+                    ai_adm = parsed.get("detected_admission_no")
+                    if ai_adm and str(ai_adm).strip() and str(ai_adm).strip().lower() not in ("null", "none", "n/a", "unknown", "unmatched"):
+                        admission_no = str(ai_adm).strip()
+
+                    ai_roll = parsed.get("detected_roll_no")
+                    if ai_roll and str(ai_roll).strip() and str(ai_roll).strip().lower() not in ("null", "none", "n/a", "unknown", "unmatched"):
+                        roll_no = str(ai_roll).strip()
+
+                    ai_kuhs = parsed.get("detected_kuhs_reg_no")
+                    if ai_kuhs and str(ai_kuhs).strip() and str(ai_kuhs).strip().lower() not in ("null", "none", "n/a", "unknown", "unmatched"):
+                        kuhs_reg_no = str(ai_kuhs).strip()
 
                     ai_id = parsed.get("detected_student_id")
                     if (
@@ -1929,9 +1982,10 @@ Return a single JSON object with this EXACT schema:
                         and str(ai_id).strip().lower() not in ("null", "none", "n/a", "student", "unknown", "unmatched")
                     ):
                         detected_student_id = str(ai_id).strip()
-                    elif not detected_student_id and vision_images:
-                        # Only clear if it was NOT already extracted from PDF text
-                        detected_student_id = None
+
+                    # Fallback to admission_no, roll_no, kuhs_reg_no if detected_student_id is not set
+                    if not detected_student_id:
+                        detected_student_id = admission_no or roll_no or kuhs_reg_no or None
 
                     if ai_status == "unverified" or ai_manual_review:
                         is_unverified = True
@@ -1956,6 +2010,12 @@ Return a single JSON object with this EXACT schema:
         breakdown_by_qno = {q.get("question_no"): q for q in raw_breakdown if isinstance(q, dict)}
         logger.info(f"Booklet #{booklet_idx}: Matched {len(breakdown_by_qno)}/{len(questions)} question(s) from AI breakdown.")
 
+        no_resp_markers = ["[unanswered]", "[crossed out]", "[blank]", "[skipped]"]
+        no_resp_phrases = [
+            "not attempted", "could not be located", "not located", "not found on",
+            "was left blank", "unanswered question", "skipped by student", "no response", "no answer"
+        ]
+
         for q_item in questions:
             q_num = q_item.get("question_no")
             q_max = float(q_item.get("max_marks", 10.0))
@@ -1970,9 +2030,66 @@ Return a single JSON object with this EXACT schema:
 
                 student_resp = str(b_item.get("student_response", "")).strip()
 
-                # Validate answer key presence
-                if not q_key or not str(q_key).strip():
+                extraction_fail_phrases = [
+                    "extraction failed", "extraction failure", "failed to extract",
+                    "could not be extracted", "matching failed", "question matching failed",
+                    "unreadable scan", "scan error", "extraction error"
+                ]
+                has_extraction_fail = (
+                    any(p in student_resp.lower() for p in extraction_fail_phrases)
+                    or any(p in str(b_item.get("feedback", "")).lower() for p in extraction_fail_phrases)
+                    or b_item.get("extraction_failed") is True
+                )
+
+                has_no_attempt_phrase = (
+                    any(p in student_resp.lower() for p in no_resp_phrases)
+                    or any(p in str(b_item.get("feedback", "")).lower() for p in ["could not be located", "was not attempted", "was left blank", "skipped"])
+                )
+                is_unanswered = (
+                    not has_extraction_fail
+                    and (
+                        b_item.get("is_attempted") is False
+                        or not student_resp
+                        or any(student_resp.lower().strip() == m for m in no_resp_markers)
+                        or (has_no_attempt_phrase and len(student_resp) < 140 and not b_item.get("has_student_work", False))
+                    )
+                )
+
+                # 1. Extraction or question matching failure - NOT an unattempted question! Flag for manual review.
+                if has_extraction_fail:
+                    logger.warning(f"Question {q_num} could not be evaluated due to extraction/matching failure. Flagging for manual review.")
+                    b_item["is_attempted"] = True
+                    b_item["pending_review"] = True
+                    b_item["obtained_marks"] = 0.0
+                    b_item["student_response"] = "[Extraction failure - Flagged for manual review]"
+                    b_item["feedback"] = "Question response could not be located due to extraction or matching failure. Flagged for manual review."
+                    b_item["step_marking"] = [
+                        {
+                            "step": "Manual Verification Required (Extraction Failure)",
+                            "max_marks": q_max,
+                            "obtained_marks": 0.0,
+                            "status": "Zero"
+                        }
+                    ]
+                # 2. Blank or unattempted question
+                elif is_unanswered:
+                    b_item["is_attempted"] = False
+                    b_item["pending_review"] = False
+                    b_item["obtained_marks"] = 0.0
+                    b_item["student_response"] = "[Crossed out]" if "[crossed out]" in student_resp.lower() else "[Unanswered]"
+                    b_item["feedback"] = b_item.get("feedback") or f"Question {q_num} was not attempted by the student."
+                    b_item["step_marking"] = [
+                        {
+                            "step": "Question attempted",
+                            "max_marks": q_max,
+                            "obtained_marks": 0.0,
+                            "status": "Zero"
+                        }
+                    ]
+                # 2. Validate answer key presence
+                elif not q_key or not str(q_key).strip():
                     logger.warning(f"Question {q_num} has missing answer key. Flagging for manual review.")
+                    b_item["is_attempted"] = True
                     b_item["pending_review"] = True
                     b_item["obtained_marks"] = 0.0
                     b_item["feedback"] = f"Missing answer key / model answer for Question {q_num}. Question cannot be evaluated without authoritative marking criteria."
@@ -1984,7 +2101,7 @@ Return a single JSON object with this EXACT schema:
                             "status": "Zero"
                         }
                     ]
-                # Strictly reject forbidden generic placeholders
+                # 3. Strictly reject forbidden generic placeholders
                 elif contains_forbidden_placeholder(student_resp):
                     logger.warning(f"Question {q_num} response contained forbidden placeholder: '{student_resp}'. Flagging for manual review.")
                     b_item["is_attempted"] = True
@@ -2000,9 +2117,18 @@ Return a single JSON object with this EXACT schema:
                             "status": "Zero"
                         }
                     ]
-                # Reject copied answer key
-                elif len(student_resp) > 30 and q_key and student_resp.lower() == q_key.strip().lower():
-                    logger.warning(f"Question {q_num} student response duplicated model answer key. Flagging for review.")
+                # 4. Reject genuine system-generated duplication (integrity issues / prompt leakage)
+                elif (
+                    (b_item.get("duplication_detected") is True or b_item.get("integrity_violation") == "system_duplication")
+                    or (
+                        len(student_resp) > 30
+                        and q_key
+                        and student_resp.strip().lower() == q_key.strip().lower()
+                        and not vision_images
+                        and (not booklet_text or q_key.strip().lower() not in booklet_text.lower())
+                    )
+                ):
+                    logger.warning(f"Question {q_num} student response duplicated model answer key without handwritten backing. Flagging for review.")
                     b_item["is_attempted"] = True
                     b_item["pending_review"] = True
                     b_item["obtained_marks"] = 0.0
@@ -2016,8 +2142,8 @@ Return a single JSON object with this EXACT schema:
                             "status": "Zero"
                         }
                     ]
+                # 5. Question flagged for review (illegible handwriting, unassociated response)
                 elif b_item.get("pending_review"):
-                    # Questions flagged for review cannot have fabricated marks
                     b_item["obtained_marks"] = 0.0
                     b_item["is_attempted"] = True
                     if not student_resp or student_resp == "[Illegible handwriting - Flagged for manual review]":
@@ -2030,23 +2156,11 @@ Return a single JSON object with this EXACT schema:
                             "status": "Zero"
                         }
                     ]
-                elif not b_item.get("is_attempted"):
-                    b_item["obtained_marks"] = 0.0
-                    b_item["pending_review"] = False
-                    b_item["student_response"] = student_resp if student_resp in ["[Crossed out]", "[Unanswered]"] else "[Unanswered]"
-                    b_item["feedback"] = b_item.get("feedback") or f"Question {q_num} was not attempted by the student."
-                    b_item["step_marking"] = [
-                        {
-                            "step": "Question attempted",
-                            "max_marks": q_max,
-                            "obtained_marks": 0.0,
-                            "status": "Zero"
-                        }
-                    ]
+                # 6. Legitimate evaluated answer (including correct answers closely matching model answer)
                 else:
-                    # Legitimate evaluated answer: validate marks bounds and step marking
                     raw_obt = float(b_item.get("obtained_marks", 0.0))
                     b_item["obtained_marks"] = max(0.0, min(round(raw_obt, 1), q_max))
+                    b_item["is_attempted"] = True
                     b_item["pending_review"] = False
 
                     steps = b_item.get("step_marking") or []
@@ -2100,28 +2214,27 @@ Return a single JSON object with this EXACT schema:
                 )
                 normalized_breakdown.append(b_item)
             else:
-                # Question not located in model breakdown
-                is_substantive = bool(has_document_content)
-                logger.warning(f"Question {q_num} was omitted from AI breakdown. Flagging for review: substantive={is_substantive}")
+                # Question was not in model breakdown - student left it unanswered
+                logger.info(f"Question {q_num} was omitted from AI breakdown - student did not attempt Question {q_num}.")
                 normalized_breakdown.append({
                     "question_no": q_num,
                     "question_text": q_txt,
                     "question_type": q_item.get("question_type", "Descriptive"),
                     "max_marks": q_max,
                     "obtained_marks": 0.0,
-                    "is_attempted": is_substantive,
-                    "pending_review": is_substantive,
+                    "is_attempted": False,
+                    "pending_review": False,
                     "answer_key": q_key,
-                    "student_response": "[Not located in automated evaluation - Flagged for manual review]" if is_substantive else "[Unanswered]",
+                    "student_response": "[Unanswered]",
                     "step_marking": [
                         {
-                            "step": "Manual Verification Required" if is_substantive else "Question attempted",
+                            "step": "Question attempted",
                             "max_marks": q_max,
                             "obtained_marks": 0.0,
                             "status": "Zero"
                         }
                     ],
-                    "feedback": f"Question {q_num} could not be located in automated vision evaluation. Flagged for manual review." if is_substantive else f"Question {q_num} was not attempted by the student."
+                    "feedback": f"Question {q_num} was not attempted by the student."
                 })
     else:
         # AI evaluation was unavailable or completely failed: DO NOT INVENT MARKS OR FALLBACK MULTIPLIERS!
@@ -2250,22 +2363,14 @@ Return a single JSON object with this EXACT schema:
     identity_manual_review = match_result["identity_manual_review"]
     recognized_text_str = match_result["recognized_text"]
 
-    if rec_status in ("matched", "unverified"):
-        final_student_name = str(detected_student_name).strip() if detected_student_name else ""
-        raw_id_str = str(detected_student_id).strip() if detected_student_id else ""
-        # Preserve leading zeros! If raw_id_str has leading zeros (e.g. '0042', '0123') or is non-digit, keep as str!
-        if detected_student_id and raw_id_str.isdigit() and not (len(raw_id_str) > 1 and raw_id_str.startswith("0")):
-            final_student_id: Union[str, int] = int(raw_id_str)
-        else:
-            final_student_id = raw_id_str
+    # Preserve document-extracted identity exactly as extracted without injecting PHP backend data
+    final_student_name = str(detected_student_name).strip() if detected_student_name else ""
+    raw_id_str = str(detected_student_id).strip() if detected_student_id else ""
+    # Preserve leading zeros! If raw_id_str has leading zeros (e.g. '0042', '0123') or is non-digit, keep as str!
+    if detected_student_id and raw_id_str.isdigit() and not (len(raw_id_str) > 1 and raw_id_str.startswith("0")):
+        final_student_id: Union[str, int] = int(raw_id_str)
     else:
-        # Strictly guarantee no identity from PHP backend is exposed as if extracted from document
-        final_student_name = ""
-        final_student_id = ""
-        admission_no = ""
-        roll_no = ""
-        kuhs_reg_no = ""
-        student_image = ""
+        final_student_id = raw_id_str
 
     # Page metadata
     pages_meta = [
@@ -2577,11 +2682,17 @@ def process_paper_evaluation(
                 for idx, b in enumerate(detected_booklets, start=1):
                     expected_for_b = None
                     if backend_roster:
-                        b_det_id = b.get("detected_id") or b.get("detected_roll")
+                        b_det_id = b.get("detected_id") or b.get("detected_adm") or b.get("detected_roll")
                         if b_det_id:
                             norm_b_id = normalize_id_for_comparison(b_det_id)
                             for s_entry in backend_roster:
-                                if s_entry.get("student_id") and normalize_id_for_comparison(s_entry["student_id"]) == norm_b_id:
+                                entry_codes = [
+                                    s_entry.get("admission_no"),
+                                    s_entry.get("roll_no"),
+                                    s_entry.get("kuhs_reg_no"),
+                                    s_entry.get("student_id")
+                                ]
+                                if any(c and normalize_id_for_comparison(c) == norm_b_id for c in entry_codes):
                                     expected_for_b = s_entry
                                     break
                         if not expected_for_b and idx <= len(backend_roster):
@@ -2697,19 +2808,19 @@ def process_paper_evaluation(
                 "focus_areas": s["ai_insights"].get("focus_areas", []) if isinstance(s.get("ai_insights"), dict) else []
             }
             record_id = s.get("id") or idx
-            is_extracted = (s.get("recognition_status") in ("matched", "unverified")) and bool(s.get("student_name") or s.get("student_id"))
+            record_id = s.get("id") or idx
             get_students_list.append({
                 "id": str(record_id),
                 "evaluation_id": str(eval_id),
-                "student_id": str(s.get("student_id", "")) if is_extracted else "",
-                "student_name": s.get("student_name", "") if is_extracted else "",
-                "admission_no": s.get("admission_no", "") if is_extracted else "",
-                "roll_no": str(s.get("roll_no", "")) if is_extracted else "",
-                "kuhs_reg_no": str(s.get("kuhs_reg_no", "")) if is_extracted else "",
-                "student_image": s.get("student_image", "") if is_extracted else "",
-                "recognized_text": s.get("recognized_text", "") if is_extracted else "",
-                "recognition_status": s.get("recognition_status", "unmatched") if is_extracted else "unmatched",
-                "recognition_confidence": s.get("recognition_confidence", 0.0) if is_extracted else 0.0,
+                "student_id": str(s.get("student_id", "")),
+                "student_name": s.get("student_name", ""),
+                "admission_no": s.get("admission_no", ""),
+                "roll_no": str(s.get("roll_no", "")),
+                "kuhs_reg_no": str(s.get("kuhs_reg_no", "")),
+                "student_image": s.get("student_image", ""),
+                "recognized_text": s.get("recognized_text", ""),
+                "recognition_status": s.get("recognition_status", "unmatched"),
+                "recognition_confidence": s.get("recognition_confidence", 0.0),
                 "file_name": s.get("file_name", ""),
                 "file_path": s.get("file_path", ""),
                 "total_questions": s.get("total_questions", 0),
