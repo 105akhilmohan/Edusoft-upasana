@@ -219,6 +219,33 @@ def resolve_file_location(path_or_url: str) -> Optional[str]:
     return None
 
 
+def normalize_extracted_text(text: str) -> str:
+    """
+    Normalize whitespace and common PDF text-extraction artifacts
+    without altering the actual student name or ID.
+    Preserves leading zeros and meaningful letters, hyphens, slashes, etc.
+    """
+    if not text:
+        return ""
+    # Replace non-breaking spaces and other special space chars with standard space
+    text = re.sub(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff]", " ", text)
+    # Remove soft hyphens and zero-width spaces
+    text = re.sub(r"[\xad\u200b\u200c\u200d]", "", text)
+    # Normalize typographical single quotes / apostrophes
+    text = re.sub(r"[\u2018\u2019\u201a\u201b`]", "'", text)
+    # Normalize typographical double quotes
+    text = re.sub(r"[\u201c\u201d\u201e\u201f]", '"', text)
+    # Normalize en-dash, em-dash, minus to hyphen
+    text = re.sub(r"[\u2013\u2014\u2212]", "-", text)
+    # Normalize multiple horizontal spaces per line while preserving line breaks
+    lines = text.splitlines()
+    normalized_lines = []
+    for line in lines:
+        cleaned_line = re.sub(r"[ \t]+", " ", line).strip()
+        normalized_lines.append(cleaned_line)
+    return "\n".join(normalized_lines)
+
+
 def extract_text_from_pdf(pdf_path: str) -> Tuple[str, int]:
     """Extract readable text and page count from all pages of a PDF."""
     try:
@@ -229,8 +256,29 @@ def extract_text_from_pdf(pdf_path: str) -> Tuple[str, int]:
             total_pages = len(pdf.pages)
             for page_idx, page in enumerate(pdf.pages, start=1):
                 t = page.extract_text()
+                if not t or not t.strip():
+                    try:
+                        t = page.extract_text(layout=True)
+                    except Exception:
+                        pass
+                if not t or not t.strip():
+                    try:
+                        tables = page.extract_tables()
+                        if tables:
+                            table_lines = []
+                            for table in tables:
+                                for row in table:
+                                    if row:
+                                        cleaned_row = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                                        if cleaned_row:
+                                            table_lines.append(" : ".join(cleaned_row))
+                            if table_lines:
+                                t = "\n".join(table_lines)
+                    except Exception:
+                        pass
                 if t and t.strip():
-                    extracted_pages.append(f"--- PAGE {page_idx} ---\n{t.strip()}")
+                    norm_t = normalize_extracted_text(t)
+                    extracted_pages.append(f"--- PAGE {page_idx} ---\n{norm_t}")
         return "\n\n".join(extracted_pages).strip(), total_pages
     except Exception as e:
         logger.warning(f"pdfplumber text extraction failed on {pdf_path}: {e}")
@@ -301,8 +349,29 @@ def extract_page_text_from_pdf(
                 if 1 <= p_num <= total_pdf_pages:
                     page = pdf.pages[p_num - 1]
                     t = page.extract_text()
+                    if not t or not t.strip():
+                        try:
+                            t = page.extract_text(layout=True)
+                        except Exception:
+                            pass
+                    if not t or not t.strip():
+                        try:
+                            tables = page.extract_tables()
+                            if tables:
+                                table_lines = []
+                                for table in tables:
+                                    for row in table:
+                                        if row:
+                                            cleaned_row = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                                            if cleaned_row:
+                                                table_lines.append(" : ".join(cleaned_row))
+                                if table_lines:
+                                    t = "\n".join(table_lines)
+                        except Exception:
+                            pass
                     if t and t.strip():
-                        extracted.append(f"--- PAGE {p_num} ---\n{t.strip()}")
+                        norm_t = normalize_extracted_text(t)
+                        extracted.append(f"--- PAGE {p_num} ---\n{norm_t}")
         return "\n\n".join(extracted).strip()
     except Exception as e:
         logger.warning(f"extract_page_text_from_pdf failed for {pdf_path}: {e}")
@@ -355,63 +424,302 @@ FORBIDDEN_NAME_WORDS = {
     "branch", "course", "degree", "test", "marks", "grade", "faculty", "department",
     "edusoft", "module", "assignment", "evaluation", "reg", "roll", "admission",
     "total", "score", "pass", "fail", "model", "answer", "signature", "pharmacy",
-    "nursing", "engineering", "school", "medical", "centre", "center", "title"
+    "nursing", "engineering", "school", "medical", "centre", "center", "title",
+    "instructor", "invigilator", "teacher", "evaluator", "examiner", "candidate",
+    "student", "code", "year", "session", "instruction", "instructions", "booklet",
+    "book", "duration", "time", "hours", "mins", "maximum", "min", "max",
+    "hall", "ticket", "scheme", "syllabus", "regular", "supplementary", "theory",
+    "practical", "page", "sheet", "pages", "sheets", "pathology", "anatomy",
+    "physiology", "pharmacology", "microbiology", "biochemistry", "medicine",
+    "surgery", "pediatrics", "mathematics", "physics", "chemistry", "biology"
 }
 
 
-def extract_identity_from_document_text(text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """
-    Search document text for student name and student ID.
-    ONLY returns name/ID if explicitly written on the document header/cover page.
-    """
-    if not text:
-        return None, None, None, None, None
+def _validate_student_name(cand: str) -> Optional[str]:
+    """Validate extracted student name string."""
+    if not cand:
+        return None
+    # Strip any trailing field delimiters or punctuation
+    cand = cand.strip(" \t\r\n:.-,;=#")
+    if len(cand) < 2 or len(cand) > 50:
+        return None
+    # Must have at least 2 letters
+    if sum(c.isalpha() for c in cand) < 2:
+        return None
+    # A student name should not contain numbers
+    if any(c.isdigit() for c in cand):
+        return None
+    lower_cand = cand.lower()
+    # Check if starts with non-name prefixes
+    if any(lower_cand.startswith(f) for f in [
+        "question", "section", "subject", "exam", "paper", "test", "final", "total",
+        "marks", "date", "class", "signature", "invigilator", "page", "sheet", "instructions"
+    ]):
+        return None
+    words = [w.strip(".,;:()") for w in lower_cand.split() if w.strip(".,;:()")]
+    if len(words) < 1 or len(words) > 6:
+        return None
+    # Check against forbidden words
+    for w in words:
+        if len(w) >= 3 and w in FORBIDDEN_NAME_WORDS:
+            return None
+    if lower_cand in FORBIDDEN_NAME_WORDS:
+        return None
+    return cand
 
-    header_chunk = text[:1500]
-    detected_name = None
+
+def _validate_student_id(cand: str) -> Optional[str]:
+    """Validate extracted student ID string, preserving leading zeros and symbols."""
+    if not cand:
+        return None
+    cand = cand.strip(" \t\r\n:.-,;=#")
+    if not cand:
+        return None
+    lower_cand = cand.lower()
+    if lower_cand in ("null", "none", "n/a", "na", "nil", "blank", "pending", "unknown", "undefined"):
+        return None
+    # Do not confuse with dates (e.g. 14/10/2026 or 2026-10-14)
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$", cand) or re.match(r"^\d{4}[/-]\d{1,2}[/-]\d{1,2}$", cand):
+        return None
+    # Do not confuse with question numbers or section headers
+    if re.match(r"^(?:Question|Q|Ans|Section|Page|Sheet)\b", cand, re.IGNORECASE):
+        return None
+    # Must have at least 1 letter or digit
+    if not any(c.isalnum() for c in cand):
+        return None
+    if len(cand) > 35:
+        return None
+    return cand
+
+
+def _extract_name_from_text(chunk: str) -> Optional[str]:
+    """Extract candidate/student name from text chunk supporting all format variations."""
+    if not chunk:
+        return None
+
+    # Pattern 1: Same line with separator (colon, hyphen, dot, equal, or space)
+    # e.g., "Student Name: Rahul Verma", "Candidate Name - Rahul Verma", "Name of Student: Rahul Verma"
+    pattern_same_line = re.compile(
+        r"(?:Student\s*Name|Candidate\s*Name|Name\s*of\s*(?:the\s*)?(?:Student|Candidate|Examinee)|Student(?:'s)?\s*Name|Candidate(?:'s)?\s*Name|Examinee\s*Name)"
+        r"[ \t]*[:\-\.=#]?[ \t]*([A-Za-z][A-Za-z\s\.\'\-]{1,50}?)"
+        r"(?=[ \t]*(?:\r?\n|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|\b\d{4}\b|$))",
+        re.IGNORECASE
+    )
+    for m in pattern_same_line.finditer(chunk):
+        val = _validate_student_name(m.group(1))
+        if val:
+            return val
+
+    # Pattern 2: Line break between label and name
+    # e.g., "Student Name:\nRahul Verma", "Candidate Name\nRahul Verma"
+    pattern_next_line = re.compile(
+        r"(?:Student\s*Name|Candidate\s*Name|Name\s*of\s*(?:the\s*)?(?:Student|Candidate|Examinee)|Student(?:'s)?\s*Name|Candidate(?:'s)?\s*Name|Examinee\s*Name)"
+        r"[ \t]*[:\-\.=#]?[ \t]*\r?\n[ \t]*([A-Za-z][A-Za-z\s\.\'\-]{1,50}?)"
+        r"(?=[ \t]*(?:\r?\n|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|$))",
+        re.IGNORECASE
+    )
+    for m in pattern_next_line.finditer(chunk):
+        val = _validate_student_name(m.group(1))
+        if val:
+            return val
+
+    # Pattern 3: Block header "Candidate Information:" followed by "Name: ..."
+    pattern_block = re.compile(
+        r"(?:Candidate|Student|Examinee)\s*(?:Information|Details|Particulars|Data)[\s\S]{1,200}?"
+        r"\bName[ \t]*[:\-\.=#]?[ \t]*([A-Za-z][A-Za-z\s\.\'\-]{1,50}?)"
+        r"(?=[ \t]*(?:\r?\n|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|$))",
+        re.IGNORECASE
+    )
+    m_block = pattern_block.search(chunk)
+    if m_block:
+        val = _validate_student_name(m_block.group(1))
+        if val:
+            return val
+
+    return None
+
+
+def _extract_ids_from_text(chunk: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Extract student ID, roll number, admission number, and KUHS registration number
+    from a text chunk. Preserves leading zeros and meaningful symbols.
+    Returns: (detected_id, detected_adm, detected_roll, detected_kuhs)
+    """
+    if not chunk:
+        return None, None, None, None
+
     detected_id = None
     detected_adm = None
     detected_roll = None
     detected_kuhs = None
 
-    # Pattern for Student Name / Candidate Name
-    name_match = re.search(
-        r"(?:Student\s*Name|Candidate\s*Name|Name\s*of\s*(?:the\s*)?(?:Student|Candidate))\s*[:\-\. ]\s*([A-Za-z\s\.]{2,40})",
-        header_chunk,
+    # Stop lookahead to avoid capturing subsequent form fields on same line
+    stop_lookahead = r"(?=[ \t]*(?:\r?\n|Name|Roll|Reg|Adm|ID|Date|Sub|Class|Sem|Sign|KUHS|Branch|Course|Exam|Paper|Marks|Page|Sheet|$))"
+
+    # 1. Student ID / Candidate ID / Student Number / Student No / Candidate Number
+    sid_re_same = re.compile(
+        r"(?:Student\s*ID|Candidate\s*ID|Student\s*Id|Candidate\s*Id|Student\s*Number|Candidate\s*Number|Student\s*No\.?|Candidate\s*No\.?)"
+        r"[ \t]*[:\-\.=#]?[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
         re.IGNORECASE
     )
-    if name_match:
-        cand = name_match.group(1).strip()
-        lower_cand = cand.lower()
-        words = set(lower_cand.split())
-        if (
-            len(cand) >= 2
-            and len(words) <= 5
-            and not words.intersection(FORBIDDEN_NAME_WORDS)
-            and not any(lower_cand.startswith(f) for f in ["question", "section", "subject", "exam", "paper", "test", "final"])
-        ):
-            detected_name = cand
-
-    # Pattern for Student ID / Candidate ID
-    id_match = re.search(
-        r"(?:Student\s*ID|Candidate\s*ID|Student\s*Id|Candidate\s*Id|Student\s*No)\s*[:\-\. ]\s*([A-Za-z0-9\-_/]+)",
-        header_chunk,
+    sid_re_next = re.compile(
+        r"(?:Student\s*ID|Candidate\s*ID|Student\s*Id|Candidate\s*Id|Student\s*Number|Candidate\s*Number|Student\s*No\.?|Candidate\s*No\.?)"
+        r"[ \t]*[:\-\.=#]?[ \t]*\r?\n[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
         re.IGNORECASE
     )
-    if id_match:
-        detected_id = id_match.group(1).strip()
+    for m in list(sid_re_same.finditer(chunk)) + list(sid_re_next.finditer(chunk)):
+        val = _validate_student_id(m.group(1))
+        if val:
+            detected_id = val
+            break
 
-    adm_match = re.search(r"(?:Admission\s*No|Adm\s*No|Admission\s*Number)\s*[:\-\. ]\s*([A-Za-z0-9\-_/]+)", header_chunk, re.IGNORECASE)
-    if adm_match:
-        detected_adm = adm_match.group(1).strip()
+    # 2. Admission Number / Admission No / Adm No
+    adm_re_same = re.compile(
+        r"(?:Admission\s*Number|Admission\s*No\.?|Adm\s*Number|Adm\s*No\.?|Admission\s*#)"
+        r"[ \t]*[:\-\.=#]?[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+        re.IGNORECASE
+    )
+    adm_re_next = re.compile(
+        r"(?:Admission\s*Number|Admission\s*No\.?|Adm\s*Number|Adm\s*No\.?|Admission\s*#)"
+        r"[ \t]*[:\-\.=#]?[ \t]*\r?\n[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+        re.IGNORECASE
+    )
+    for m in list(adm_re_same.finditer(chunk)) + list(adm_re_next.finditer(chunk)):
+        val = _validate_student_id(m.group(1))
+        if val:
+            detected_adm = val
+            break
 
-    roll_match = re.search(r"(?:Roll\s*No|Roll\s*Number)\s*[:\-\. ]\s*([A-Za-z0-9\-_/]+)", header_chunk, re.IGNORECASE)
-    if roll_match:
-        detected_roll = roll_match.group(1).strip()
+    # 3. Roll Number / Roll No
+    roll_re_same = re.compile(
+        r"(?:Roll\s*Number|Roll\s*No\.?|Roll\s*#)"
+        r"[ \t]*[:\-\.=#]?[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+        re.IGNORECASE
+    )
+    roll_re_next = re.compile(
+        r"(?:Roll\s*Number|Roll\s*No\.?|Roll\s*#)"
+        r"[ \t]*[:\-\.=#]?[ \t]*\r?\n[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+        re.IGNORECASE
+    )
+    for m in list(roll_re_same.finditer(chunk)) + list(roll_re_next.finditer(chunk)):
+        val = _validate_student_id(m.group(1))
+        if val:
+            detected_roll = val
+            break
 
-    kuhs_match = re.search(r"(?:KUHS\s*Reg\s*No|KUHS\s*No|Reg\s*No|Registration\s*No)\s*[:\-\. ]\s*([A-Za-z0-9\-_/]+)", header_chunk, re.IGNORECASE)
-    if kuhs_match:
-        detected_kuhs = kuhs_match.group(1).strip()
+    # 4. KUHS Registration Number / KUHS Reg No / KUHS No
+    kuhs_re_same = re.compile(
+        r"(?:KUHS\s*Registration\s*Number|KUHS\s*Reg(?:istration)?\s*No\.?|KUHS\s*Register\s*Number|KUHS\s*No\.?)"
+        r"[ \t]*[:\-\.=#]?[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+        re.IGNORECASE
+    )
+    kuhs_re_next = re.compile(
+        r"(?:KUHS\s*Registration\s*Number|KUHS\s*Reg(?:istration)?\s*No\.?|KUHS\s*Register\s*Number|KUHS\s*No\.?)"
+        r"[ \t]*[:\-\.=#]?[ \t]*\r?\n[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+        re.IGNORECASE
+    )
+    for m in list(kuhs_re_same.finditer(chunk)) + list(kuhs_re_next.finditer(chunk)):
+        val = _validate_student_id(m.group(1))
+        if val:
+            detected_kuhs = val
+            break
+
+    # 5. General Register Number / Reg No / Registration Number (if KUHS not matched)
+    if not detected_kuhs:
+        reg_re_same = re.compile(
+            r"(?:Registration\s*Number|Registration\s*No\.?|Register\s*Number|Register\s*No\.?|Reg\s*Number|Reg\s*No\.?)"
+            r"[ \t]*[:\-\.=#]?[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+            re.IGNORECASE
+        )
+        reg_re_next = re.compile(
+            r"(?:Registration\s*Number|Registration\s*No\.?|Register\s*Number|Register\s*No\.?|Reg\s*Number|Reg\s*No\.?)"
+            r"[ \t]*[:\-\.=#]?[ \t]*\r?\n[ \t]*([A-Za-z0-9][A-Za-z0-9\-_/\.]{0,35})" + stop_lookahead,
+            re.IGNORECASE
+        )
+        for m in list(reg_re_same.finditer(chunk)) + list(reg_re_next.finditer(chunk)):
+            val = _validate_student_id(m.group(1))
+            if val:
+                detected_kuhs = val
+                break
+
+    # If detected_id was not explicitly set by Student ID / Candidate ID / Student Number,
+    # fall back to roll number, registration number, or admission number
+    if not detected_id:
+        detected_id = detected_roll or detected_kuhs or detected_adm
+
+    return detected_id, detected_adm, detected_roll, detected_kuhs
+
+
+def extract_identity_from_document_text(
+    text: str,
+    page_texts: Optional[List[str]] = None
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Search document text for student name and student ID.
+    - Inspects the full cover page and header of the booklet.
+    - Preserves page boundaries and inspects Page 1 first.
+    - Searches additional pages only when needed to recover missing identity info.
+    - Normalizes PDF extraction artifacts without altering actual student name or ID.
+    - Preserves leading zeros and symbols in IDs.
+    Returns: (detected_name, detected_id, detected_adm, detected_roll, detected_kuhs)
+    """
+    if not text and not page_texts:
+        return None, None, None, None, None
+
+    # Decompose into pages if not explicitly provided
+    pages: List[str] = []
+    if page_texts and isinstance(page_texts, list) and len(page_texts) > 0:
+        pages = [normalize_extracted_text(p) for p in page_texts if p]
+    elif text:
+        norm_full = normalize_extracted_text(text)
+        # Split by page marker if present
+        page_chunks = re.split(r"(?:^|\n)---\s*PAGE\s*\d+\s*---\n?", norm_full, flags=re.IGNORECASE)
+        pages = [c.strip() for c in page_chunks if c and c.strip()]
+        if not pages:
+            pages = [norm_full.strip()]
+
+    if not pages:
+        return None, None, None, None, None
+
+    # Step 1: Inspect Page 1 (full cover page and candidate information section)
+    page_1 = pages[0]
+    detected_name = _extract_name_from_text(page_1)
+    detected_id, detected_adm, detected_roll, detected_kuhs = _extract_ids_from_text(page_1)
+
+    # If both name and ID are found on Page 1, return immediately
+    if detected_name and detected_id:
+        return detected_name, detected_id, detected_adm, detected_roll, detected_kuhs
+
+    # Step 2: Search additional pages in the booklet ONLY when needed to recover identity
+    for p_idx in range(1, len(pages)):
+        p_chunk = pages[p_idx]
+        # Check header area (first 800 chars) as well as candidate block
+        header_chunk = p_chunk[:800]
+        search_chunk = p_chunk if len(p_chunk) <= 1500 else header_chunk
+
+        if not detected_name:
+            rec_name = _extract_name_from_text(search_chunk)
+            if rec_name:
+                detected_name = rec_name
+
+        if not detected_id:
+            rec_id, rec_adm, rec_roll, rec_kuhs = _extract_ids_from_text(search_chunk)
+            if rec_id:
+                detected_id = rec_id
+            if rec_adm and not detected_adm:
+                detected_adm = rec_adm
+            if rec_roll and not detected_roll:
+                detected_roll = rec_roll
+            if rec_kuhs and not detected_kuhs:
+                detected_kuhs = rec_kuhs
+
+        # Break early once both name and ID are recovered
+        if detected_name and detected_id:
+            break
+
+    # Final resolution of detected_id if name exists but ID was roll/kuhs/adm
+    if not detected_id:
+        detected_id = detected_roll or detected_kuhs or detected_adm
 
     return detected_name, detected_id, detected_adm, detected_roll, detected_kuhs
 
@@ -616,8 +924,28 @@ def detect_booklet_boundaries(
         with pdfplumber.open(pdf_path) as pdf:
             total_pages = len(pdf.pages)
             for page in pdf.pages:
-                t = page.extract_text() or ""
-                page_texts.append(t)
+                t = page.extract_text()
+                if not t or not t.strip():
+                    try:
+                        t = page.extract_text(layout=True)
+                    except Exception:
+                        pass
+                if not t or not t.strip():
+                    try:
+                        tables = page.extract_tables()
+                        if tables:
+                            table_lines = []
+                            for table in tables:
+                                for row in table:
+                                    if row:
+                                        cleaned_row = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                                        if cleaned_row:
+                                            table_lines.append(" : ".join(cleaned_row))
+                            if table_lines:
+                                t = "\n".join(table_lines)
+                    except Exception:
+                        pass
+                page_texts.append(normalize_extracted_text(t or ""))
     except Exception as e:
         logger.warning(f"Could not open PDF {pdf_path} for boundary detection: {e}")
         return [{
@@ -637,7 +965,7 @@ def detect_booklet_boundaries(
 
     if total_pages <= 1:
         txt = page_texts[0] if page_texts else ""
-        d_name, d_id, d_adm, d_roll, d_kuhs = extract_identity_from_document_text(txt)
+        d_name, d_id, d_adm, d_roll, d_kuhs = extract_identity_from_document_text(txt, page_texts=[txt] if txt else None)
         return [{
             "booklet_index": 1,
             "start_page": 1,
@@ -649,19 +977,19 @@ def detect_booklet_boundaries(
             "detected_adm": d_adm,
             "detected_roll": d_roll,
             "detected_kuhs": d_kuhs,
-            "combined_text": txt,
+            "combined_text": f"--- PAGE 1 ---\n{txt}" if txt else "",
             "boundary_reason": "Single page document"
         }]
 
     total_chars = sum(len(t.strip()) for t in page_texts)
     has_text = total_chars > (15 * total_pages)
 
-    cover_re = re.compile(
-        r"(?:main\s+)?answer\s+book(?:let)?|"
-        r"examination\s+answer\s+sheet|"
-        r"candidate\s+name|student\s+name|name\s+of\s+(?:the\s+)?(?:candidate|student)|"
-        r"kuhs\s+reg(?:istration)?\s*no|register\s*no|roll\s*no|admission\s*no|"
-        r"signature\s+of\s+(?:candidate|invigilator)|hall\s+ticket",
+    cover_title_re = re.compile(
+        r"\b(?:main\s+)?answer\s+book(?:let)?\b|"
+        r"\bexamination\s+answer\s+sheet\b|"
+        r"\binstructions\s+to\s+candidates?\b|"
+        r"\bhall\s+ticket\b|"
+        r"\bcandidate\s+information\b",
         re.IGNORECASE
     )
     page_one_re = re.compile(
@@ -673,17 +1001,28 @@ def detect_booklet_boundaries(
 
     boundary_starts = [1]
     reasons: Dict[int, str] = {1: "First page of document"}
+    vision_booklet_meta: Dict[int, Dict[str, Any]] = {}
 
     if has_text:
+        p1_txt = page_texts[0] if page_texts else ""
+        curr_name, curr_id, _, _, _ = extract_identity_from_document_text(p1_txt, page_texts=[p1_txt] if p1_txt else None)
         last_q_seen = 0
+
         for p_num in range(2, total_pages + 1):
             p_txt = page_texts[p_num - 1]
-            det_name, det_id, _, _, _ = extract_identity_from_document_text(p_txt)
+            p_name, p_id, _, _, _ = extract_identity_from_document_text(p_txt, page_texts=[p_txt])
 
-            is_cover = bool(cover_re.search(p_txt[:1200]))
+            is_cover = bool(cover_title_re.search(p_txt[:1200]))
             is_p1 = bool(page_one_re.search(p_txt[:800]))
             is_q1 = bool(q1_re.search(p_txt))
             q_restart = is_q1 and (last_q_seen >= 2)
+
+            # Check if there is an explicit different student identity on this page
+            diff_student_detected = False
+            if p_name and curr_name and p_name.strip().lower() != curr_name.strip().lower():
+                diff_student_detected = True
+            if p_id and curr_id and str(p_id).strip().lower() != str(curr_id).strip().lower():
+                diff_student_detected = True
 
             all_qs = re.findall(r"(?:Question\s*(\d+)|Q\s*(\d+)|\((\d+)\)|(\d+)[\.\)])", p_txt, re.IGNORECASE)
             for m_tuple in all_qs:
@@ -691,22 +1030,36 @@ def detect_booklet_boundaries(
                     if q_str and q_str.isdigit():
                         last_q_seen = max(last_q_seen, int(q_str))
 
-            if is_cover:
+            if diff_student_detected:
                 boundary_starts.append(p_num)
-                reasons[p_num] = "Cover page / candidate identification section"
+                reasons[p_num] = f"New student identity: {p_name or p_id}"
+                curr_name = p_name
+                curr_id = p_id
                 last_q_seen = 0
-            elif det_name or det_id:
+            elif is_cover:
                 boundary_starts.append(p_num)
-                reasons[p_num] = f"Student identity on page: {det_name or det_id}"
+                reasons[p_num] = "Cover page / answer booklet form"
+                curr_name = p_name or curr_name
+                curr_id = p_id or curr_id
                 last_q_seen = 0
             elif is_p1:
                 boundary_starts.append(p_num)
                 reasons[p_num] = "Page number reset to Page 1"
+                curr_name = p_name or curr_name
+                curr_id = p_id or curr_id
                 last_q_seen = 0
             elif q_restart:
                 boundary_starts.append(p_num)
                 reasons[p_num] = "Question sequence restarted from Question 1"
+                curr_name = p_name or curr_name
+                curr_id = p_id or curr_id
                 last_q_seen = 0
+            else:
+                # Same booklet continuation
+                if not curr_name and p_name:
+                    curr_name = p_name
+                if not curr_id and p_id:
+                    curr_id = p_id
     else:
         # Vision-based boundary detection for scanned handwritten PDFs
         if client and (os.getenv("OPENAI_API_KEY") or hasattr(client, "chat")):
@@ -754,6 +1107,10 @@ def detect_booklet_boundaries(
                             if sp not in boundary_starts and 1 <= sp <= total_pages:
                                 boundary_starts.append(sp)
                                 reasons[sp] = "Vision detected booklet boundary"
+                                vision_booklet_meta[sp] = {
+                                    "name": b.get("detected_student_name"),
+                                    "id": b.get("detected_student_id")
+                                }
                         boundary_starts.sort()
                         if 1 not in boundary_starts:
                             boundary_starts.insert(0, 1)
@@ -765,8 +1122,19 @@ def detect_booklet_boundaries(
     for idx, start_p in enumerate(boundary_starts):
         end_p = (boundary_starts[idx + 1] - 1) if (idx + 1 < len(boundary_starts)) else total_pages
         p_nums = list(range(start_p, end_p + 1))
-        b_text = "\n\n".join(page_texts[p - 1] for p in p_nums if p <= len(page_texts))
-        det_name, det_id, det_adm, det_roll, det_kuhs = extract_identity_from_document_text(b_text)
+        booklet_page_texts = [page_texts[p - 1] for p in p_nums if p <= len(page_texts)]
+        b_text = "\n\n".join(f"--- PAGE {p} ---\n{page_texts[p - 1]}" for p in p_nums if p <= len(page_texts))
+
+        # Extract identity independently for THIS booklet from its own pages
+        det_name, det_id, det_adm, det_roll, det_kuhs = extract_identity_from_document_text(b_text, page_texts=booklet_page_texts)
+
+        # Vision fallback if text did not yield identity on this booklet
+        v_meta = vision_booklet_meta.get(start_p, {})
+        if not det_name and v_meta.get("name"):
+            det_name = str(v_meta["name"]).strip()
+        if not det_id and v_meta.get("id"):
+            det_id = str(v_meta["id"]).strip()
+
         booklets.append({
             "booklet_index": idx + 1,
             "start_page": start_p,
@@ -1020,7 +1388,7 @@ class EvaluationStore:
             for s in safe_resp["data"].get("students", []):
                 if isinstance(s, dict):
                     # Return student identity ONLY when extracted from PDF/Image
-                    is_extracted = (s.get("recognition_status") == "matched") and bool(s.get("student_name") or s.get("student_id"))
+                    is_extracted = (s.get("recognition_status") in ("matched", "unverified")) and bool(s.get("student_name") or s.get("student_id"))
                     if not is_extracted:
                         s["student_name"] = ""
                         s["student_id"] = ""
@@ -1051,7 +1419,7 @@ class EvaluationStore:
             ):
                 s_copy = json.loads(json.dumps(s))
                 # Return student identity ONLY when extracted from PDF/Image
-                is_extracted = (s_copy.get("recognition_status") == "matched") and bool(s_copy.get("student_name") or s_copy.get("student_id"))
+                is_extracted = (s_copy.get("recognition_status") in ("matched", "unverified")) and bool(s_copy.get("student_name") or s_copy.get("student_id"))
                 if not is_extracted:
                     s_copy["student_name"] = ""
                     s_copy["student_id"] = ""
@@ -1151,6 +1519,7 @@ def evaluate_student_booklet_ai(
 
     ai_evaluated = False
     evaluated_result: Optional[Dict[str, Any]] = None
+    is_unverified = False
 
     has_document_content = bool(vision_images or (booklet_text and booklet_text.strip()))
 
@@ -1187,9 +1556,13 @@ def evaluate_student_booklet_ai(
             "   - NEVER include unrelated comments about attendance, enrollment, working days, fees, or administration.\n"
             "   - 'ai_insights.recommendation', 'focus_areas', and 'strengths' must strictly reflect the evaluated examination topics.\n"
             "   - If evaluation is unsuccessful or handwriting is unreadable, report that evaluation could not be completed and manual review is required; NEVER generate positive feedback for failed evaluations.\n\n"
-            "5. INDEPENDENT IDENTITY EXTRACTION:\n"
-            "   - ONLY extract detected_student_name and detected_student_id if VISIBLY written on this booklet cover or header.\n"
-            "   - If not visibly written on the document, return null for both and set recognition_status = 'unmatched'.\n"
+            "5. INDEPENDENT IDENTITY EXTRACTION (PRINTED & HANDWRITTEN):\n"
+            "   - Inspect the cover page, candidate information block, and top header of the answer sheet for student identity.\n"
+            "   - Support identity label variations: Student Name, Candidate Name, Name of Student, Name of Candidate, Student ID, Student Number, Student No., Candidate ID, Candidate Number, Roll Number, Roll No., Admission Number, Admission No., Register Number, Reg No., Registration Number, KUHS Registration Number.\n"
+            "   - Preserve exact ID characters: preserve leading zeros (e.g. '0042'), meaningful letters, hyphens, and slashes.\n"
+            "   - DO NOT invent missing characters or guess an unreadable ID.\n"
+            "   - If identity is ambiguous, blurred, or partially decipherable: set recognition_status = 'unverified', recognition_confidence = 50.0, and identity_manual_review = true.\n"
+            "   - If NO identity is visibly present on this booklet, return null for name and ID and set recognition_status = 'unmatched'.\n"
             "   - Grade all readable answers fully regardless of whether student identity is detected!\n\n"
             "Output strictly valid JSON matching the schema."
         )
@@ -1213,8 +1586,9 @@ Return a single JSON object with this EXACT schema:
   "detected_admission_no": null,
   "detected_roll_no": null,
   "detected_kuhs_reg_no": null,
-  "recognition_status": "matched" or "unmatched",
+  "recognition_status": "matched" or "unverified" or "unmatched",
   "recognition_confidence": 0.0,
+  "identity_manual_review": false,
   "ai_feedback": "<dynamic 2-3 sentence diagnostic review of student performance on these answers>",
   "ai_insights": {{
     "recommendation": "<constructive recommendation tailored to student answers>",
@@ -1280,6 +1654,9 @@ Return a single JSON object with this EXACT schema:
                     evaluated_result = parsed
                     ai_evaluated = True
 
+                    ai_status = str(parsed.get("recognition_status") or "").strip().lower()
+                    ai_manual_review = bool(parsed.get("identity_manual_review", False))
+
                     ai_name = parsed.get("detected_student_name")
                     if (
                         ai_name
@@ -1292,7 +1669,8 @@ Return a single JSON object with this EXACT schema:
                         admission_no = str(parsed.get("detected_admission_no") or admission_no).strip()
                         roll_no = str(parsed.get("detected_roll_no") or roll_no).strip()
                         kuhs_reg_no = str(parsed.get("detected_kuhs_reg_no") or kuhs_reg_no).strip()
-                    elif vision_images:
+                    elif not detected_student_name and vision_images:
+                        # Only clear if it was NOT already extracted from PDF text
                         detected_student_name = None
                         admission_no = ""
                         roll_no = ""
@@ -1305,8 +1683,12 @@ Return a single JSON object with this EXACT schema:
                         and str(ai_id).strip().lower() not in ("null", "none", "n/a", "student", "unknown", "unmatched")
                     ):
                         detected_student_id = str(ai_id).strip()
-                    elif vision_images:
+                    elif not detected_student_id and vision_images:
+                        # Only clear if it was NOT already extracted from PDF text
                         detected_student_id = None
+
+                    if ai_status == "unverified" or ai_manual_review:
+                        is_unverified = True
 
                     logger.info(f"OpenAI evaluation successful for booklet #{booklet_idx}. Detected Name: {detected_student_name}, ID: {detected_student_id}")
                     break
@@ -1613,13 +1995,21 @@ Return a single JSON object with this EXACT schema:
 
     if has_name or has_id:
         final_student_name = str(detected_student_name).strip() if has_name else ""
-        if has_id and str(detected_student_id).strip().isdigit():
-            final_student_id: Union[str, int] = int(str(detected_student_id).strip())
+        raw_id_str = str(detected_student_id).strip() if has_id else ""
+        # Preserve leading zeros! If raw_id_str has leading zeros (e.g. '0042', '0123') or is non-digit, keep as str!
+        if has_id and raw_id_str.isdigit() and not (len(raw_id_str) > 1 and raw_id_str.startswith("0")):
+            final_student_id: Union[str, int] = int(raw_id_str)
         else:
-            final_student_id = str(detected_student_id).strip() if has_id else ""
-        rec_status = "matched"
-        rec_conf = 98.5
-        recognized_text_str = f"Recognized: {final_student_name}" + (f" (ID: {final_student_id})" if final_student_id else "")
+            final_student_id = raw_id_str
+
+        if is_unverified:
+            rec_status = "unverified"
+            rec_conf = 50.0
+            recognized_text_str = f"Unverified: {final_student_name}" + (f" (ID: {final_student_id})" if final_student_id else "") + " - Flagged for manual review"
+        else:
+            rec_status = "matched"
+            rec_conf = 98.5
+            recognized_text_str = f"Recognized: {final_student_name}" + (f" (ID: {final_student_id})" if final_student_id else "")
     else:
         final_student_name = ""
         final_student_id = ""
@@ -1659,6 +2049,7 @@ Return a single JSON object with this EXACT schema:
         "pages_json": json.dumps(pages_meta),
         "recognition_status": rec_status,
         "recognition_confidence": rec_conf,
+        "identity_manual_review": (rec_status == "unverified"),
         "total_questions": total_q_count,
         "attempted_questions": attempted_q_count,
         "unanswered_questions": unanswered_q_count,

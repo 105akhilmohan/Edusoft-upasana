@@ -1852,7 +1852,7 @@ def evaluate_papers():
         if isinstance(response_data, dict) and "students" in response_data and isinstance(response_data["students"], list):
             for s in response_data["students"]:
                 if isinstance(s, dict):
-                    is_matched = (s.get("recognition_status") == "matched") and bool(s.get("student_name") or s.get("student_id"))
+                    is_matched = (s.get("recognition_status") in ("matched", "unverified")) and bool(s.get("student_name") or s.get("student_id"))
                     if not is_matched:
                         s["student_name"] = ""
                         s["student_id"] = ""
@@ -1927,7 +1927,7 @@ def get_evaluation_by_id(evaluation_id):
         if "students" in record["data"] and isinstance(record["data"]["students"], list):
             for s in record["data"]["students"]:
                 if isinstance(s, dict):
-                    if s.get("recognition_status") != "matched" or not (s.get("student_name") or s.get("student_id")):
+                    if s.get("recognition_status") not in ("matched", "unverified") or not (s.get("student_name") or s.get("student_id")):
                         s["student_name"] = ""
                         s["student_id"] = ""
                         s["admission_no"] = ""
@@ -1957,7 +1957,7 @@ def get_evaluation_breakdown(evaluation_id):
     if isinstance(rec_copy, dict) and "students" in rec_copy and isinstance(rec_copy["students"], list):
         for s in rec_copy["students"]:
             if isinstance(s, dict):
-                if s.get("recognition_status") != "matched" or not (s.get("student_name") or s.get("student_id")):
+                if s.get("recognition_status") not in ("matched", "unverified") or not (s.get("student_name") or s.get("student_id")):
                     s["student_name"] = ""
                     s["student_id"] = ""
                     s["admission_no"] = ""
@@ -1985,7 +1985,7 @@ def get_student_evaluation_breakdown(evaluation_id, student_id):
         }), 404
     s_copy = json.loads(json.dumps(student_eval))
     if isinstance(s_copy, dict):
-        if s_copy.get("recognition_status") != "matched" or not (s_copy.get("student_name") or s_copy.get("student_id")):
+        if s_copy.get("recognition_status") not in ("matched", "unverified") or not (s_copy.get("student_name") or s_copy.get("student_id")):
             s_copy["student_name"] = ""
             s_copy["student_id"] = ""
             s_copy["admission_no"] = ""

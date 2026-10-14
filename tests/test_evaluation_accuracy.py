@@ -24,6 +24,9 @@ from paper_evaluator import (
     contains_forbidden_placeholder,
     collect_booklet_images,
     evaluation_store,
+    extract_identity_from_document_text,
+    normalize_extracted_text,
+    detect_booklet_boundaries,
 )
 
 
@@ -604,6 +607,242 @@ class TestPaperEvaluationAccuracy(unittest.TestCase):
 
         rec_lower = result["ai_insights"]["recommendation"].lower()
         self.assertNotIn("attendance", rec_lower)
+
+    def test_11_identity_extraction_label_variations(self):
+        """11. Test all identity label variations and separator formats."""
+        # Test variations of Student Name
+        cases_name = [
+            ("Student Name: Rahul Verma\nQ1: ...", "Rahul Verma"),
+            ("Candidate Name - John Doe\nQ1: ...", "John Doe"),
+            ("Name of Student: Priya Sharma\nQ1: ...", "Priya Sharma"),
+            ("Name of Candidate: Anita Roy\nQ1: ...", "Anita Roy"),
+            ("Name of the Student = David Miller\nQ1: ...", "David Miller"),
+            ("Student's Name: Emily Davis\nQ1: ...", "Emily Davis"),
+            ("Candidate Name Rahul Verma\nQ1: ...", "Rahul Verma"),  # space only
+            ("Student Name:\nRahul Verma\nQ1: ...", "Rahul Verma"),  # newline
+            ("Candidate Name\nJohn Doe\nQ1: ...", "John Doe"),      # newline without colon
+        ]
+        for text, expected in cases_name:
+            name, _, _, _, _ = extract_identity_from_document_text(text)
+            self.assertEqual(name, expected, f"Failed for: {text!r}")
+
+        # Test variations of Student ID / Number / Roll / Adm / Reg
+        cases_id = [
+            ("Student ID: ST101\n...", "ST101"),
+            ("Student ID - ST-101/A\n...", "ST-101/A"),
+            ("Student Number: 84\n...", "84"),
+            ("Student No.: 0042\n...", "0042"),
+            ("Student No: 0042\n...", "0042"),
+            ("Candidate ID: CID-9988\n...", "CID-9988"),
+            ("Candidate Number: 456\n...", "456"),
+            ("Candidate No: 456\n...", "456"),
+            ("Roll Number: 12\n...", "12"),
+            ("Roll No.: 007\n...", "007"),
+            ("Roll No: 101\n...", "101"),
+            ("Roll No 0042\n...", "0042"),  # space only
+            ("Roll No:\n0042\n...", "0042"), # newline
+            ("Admission Number: ADM/2023/042\n...", "ADM/2023/042"),
+            ("Admission No.: ADM-01\n...", "ADM-01"),
+            ("Adm No: 2023-01\n...", "2023-01"),
+            ("Register Number: KUHS202301\n...", "KUHS202301"),
+            ("Register No.: 12345\n...", "12345"),
+            ("Reg Number: 12345\n...", "12345"),
+            ("Reg No.: 0055\n...", "0055"),
+            ("Registration Number: 987654\n...", "987654"),
+            ("Registration No.: 00987\n...", "00987"),
+            ("KUHS Registration Number: 2023001\n...", "2023001"),
+            ("KUHS Reg No: 2023001\n...", "2023001"),
+            ("KUHS Reg. No.: KUHS-2023-042\n...", "KUHS-2023-042"),
+            ("KUHS No: 2023001\n...", "2023001"),
+        ]
+        for text, expected in cases_id:
+            _, det_id, _, _, _ = extract_identity_from_document_text(text)
+            self.assertEqual(det_id, expected, f"Failed for: {text!r}")
+
+    def test_12_preserve_leading_zeros_and_symbols_in_evaluation(self):
+        """12. Preserves leading zeros and symbols in final_student_id."""
+        booklet_leading_zero = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": "Student Name: Rahul Verma\nRoll No: 0042\nQ1: Plaque rupture..."
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "Rahul Verma",
+            "detected_student_id": "0042",
+            "recognition_status": "matched",
+            "recognition_confidence": 98.0,
+            "ai_feedback": "Good work.",
+            "ai_insights": {"recommendation": "Study more.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 8.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture triggers thrombus.",
+                    "step_marking": [{"step": "Step 1", "max_marks": 10.0, "obtained_marks": 8.0, "status": "Partial"}]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet_leading_zero,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        self.assertEqual(res["student_name"], "Rahul Verma")
+        self.assertEqual(res["student_id"], "0042")
+        self.assertEqual(res["roll_no"], "0042")
+
+    def test_13_reject_forbidden_words_and_metadata(self):
+        """13. Rejects exam names, subject names, question numbers, marks, dates, and institutions."""
+        invalid_texts = [
+            "Student Name: Annual Examination 2026\nRoll No: 101",
+            "Student Name: Pathology\nRoll No: 101",
+            "Student Name: Question 1\nRoll No: 101",
+            "Candidate Name: Government Medical College\nRoll No: 101",
+            "Candidate Name: Maximum Marks 100\nRoll No: 101",
+            "Student Name: 14/10/2026\nRoll No: 101",
+        ]
+        for txt in invalid_texts:
+            name, det_id, _, _, _ = extract_identity_from_document_text(txt)
+            self.assertIsNone(name, f"Expected name to be None for {txt!r}, but got {name!r}")
+            self.assertEqual(det_id, "101")
+
+    def test_14_multipage_booklet_recovery_and_no_header_splitting(self):
+        """14. Inspects Page 1 first, recovers missing ID from Page 2 header, does NOT split on running header."""
+        page_1 = "Candidate Information:\nStudent Name: Rahul Verma\nInstructions to Candidates..."
+        page_2 = "--- PAGE 2 ---\nRahul Verma | Roll No: 101\nQ1: Plaque rupture initiates coronary occlusion..."
+        combined = f"{page_1}\n\n{page_2}"
+
+        # Page 1 had name, page 2 had roll no -> extract_identity recovers both
+        name, det_id, _, roll, _ = extract_identity_from_document_text(combined)
+        self.assertEqual(name, "Rahul Verma")
+        self.assertEqual(det_id, "101")
+        self.assertEqual(roll, "101")
+
+    def test_15_multistudent_boundary_detection_and_independent_identity(self):
+        """15. Independent extraction per booklet in combined document, without leaking across booklets."""
+        p1 = "Examination Answer Sheet\nStudent Name: Student Alpha\nRoll No: 001\nQ1: Answer A"
+        p2 = "Page 2 of 2\nStudent Alpha | Roll No: 001\nQ2: Answer A cont."
+        p3 = "Examination Answer Sheet\nStudent Name: Student Beta\nRoll No: 002\nQ1: Answer B"
+        p4 = "Page 2 of 2\nStudent Beta | Roll No: 002\nQ2: Answer B cont."
+        p5 = "Unidentified Sheet\nNo cover page or name here\nQ1: Answer C"
+
+        mock_pages = [
+            MagicMock(extract_text=MagicMock(return_value=p1), extract_tables=MagicMock(return_value=[])),
+            MagicMock(extract_text=MagicMock(return_value=p2), extract_tables=MagicMock(return_value=[])),
+            MagicMock(extract_text=MagicMock(return_value=p3), extract_tables=MagicMock(return_value=[])),
+            MagicMock(extract_text=MagicMock(return_value=p4), extract_tables=MagicMock(return_value=[])),
+            MagicMock(extract_text=MagicMock(return_value=p5), extract_tables=MagicMock(return_value=[])),
+        ]
+        mock_pdf = MagicMock(pages=mock_pages)
+        mock_pdf.__enter__.return_value = mock_pdf
+
+        with patch("pdfplumber.open", return_value=mock_pdf):
+            booklets = detect_booklet_boundaries("dummy.pdf")
+
+        self.assertGreaterEqual(len(booklets), 2)
+        # First booklet: Student Alpha, Roll 001
+        self.assertEqual(booklets[0]["detected_name"], "Student Alpha")
+        self.assertEqual(booklets[0]["detected_id"], "001")
+        # Second booklet: Student Beta, Roll 002 (never reusing Student Alpha)
+        self.assertEqual(booklets[1]["detected_name"], "Student Beta")
+        self.assertEqual(booklets[1]["detected_id"], "002")
+
+        # Third booklet (if segmented at p5) must NOT borrow Student Beta's identity
+        if len(booklets) >= 3:
+            self.assertIsNone(booklets[2]["detected_name"])
+            self.assertIsNone(booklets[2]["detected_id"])
+
+    def test_16_vision_unverified_identity_flagged_for_manual_review(self):
+        """16. Ambiguous handwritten identity returns recognition_status='unverified' and identity_manual_review=True."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "combined_text": ""  # Scanned image with unreadable handwriting
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": "R???l V?rma",
+            "detected_student_id": "ST???",
+            "recognition_status": "unverified",
+            "recognition_confidence": 45.0,
+            "identity_manual_review": True,
+            "ai_feedback": "Student identity is partially smudged.",
+            "ai_insights": {"recommendation": "Review cover sheet.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 7.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture triggers thrombosis.",
+                    "step_marking": [{"step": "Step 1", "max_marks": 10.0, "obtained_marks": 7.0, "status": "Partial"}]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        self.assertEqual(res["recognition_status"], "unverified")
+        self.assertTrue(res["identity_manual_review"])
+        self.assertIn("Flagged for manual review", res["recognized_text"])
+
+    def test_17_text_identity_not_overwritten_by_null_vision(self):
+        """17. Preserves valid text-extracted identity even if vision model returns null for identity."""
+        booklet = {
+            "booklet_index": 1,
+            "page_numbers": [1],
+            "detected_name": "Rahul Verma",
+            "detected_id": "101",
+            "combined_text": "Student Name: Rahul Verma\nRoll No: 101\nQ1: Answer text..."
+        }
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MockOpenAIResponse({
+            "detected_student_name": None,  # Vision didn't re-extract
+            "detected_student_id": None,
+            "recognition_status": "unmatched",
+            "recognition_confidence": 0.0,
+            "ai_feedback": "Evaluated successfully.",
+            "ai_insights": {"recommendation": "Good.", "focus_areas": [], "strengths": []},
+            "evaluation_breakdown": [
+                {
+                    "question_no": 1,
+                    "max_marks": 10.0,
+                    "obtained_marks": 8.0,
+                    "is_attempted": True,
+                    "pending_review": False,
+                    "student_response": "Plaque rupture answer.",
+                    "step_marking": [{"step": "Step 1", "max_marks": 10.0, "obtained_marks": 8.0, "status": "Partial"}]
+                }
+            ]
+        })
+        res = evaluate_student_booklet_ai(
+            booklet=booklet,
+            file_path="",
+            file_name="sheet.pdf",
+            questions=[self.sample_questions[0]],
+            total_marks=10.0,
+            subject_title="Pathology",
+            client=mock_client
+        )
+        # Identity extracted from text must be preserved!
+        self.assertEqual(res["student_name"], "Rahul Verma")
+        self.assertEqual(res["student_id"], 101)
+        self.assertEqual(res["recognition_status"], "matched")
 
 
 if __name__ == "__main__":
